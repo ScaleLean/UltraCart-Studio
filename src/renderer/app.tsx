@@ -4,6 +4,8 @@ import {
   ChevronDown,
   ChevronRight,
   Command,
+  Database,
+  BookOpen,
   FileText,
   Folder,
   Globe2,
@@ -11,6 +13,7 @@ import {
   Home,
   Layers3,
   LayoutGrid,
+  PanelsTopLeft,
   ListFilter,
   LoaderCircle,
   MessageSquare,
@@ -30,6 +33,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { Bootstrap, Change, Session, StorePage } from '../shared/types';
+import type { LandingProject } from '../shared/landing';
 import { errorText, invoke, subscribe } from './api';
 import { Button } from './components/ui/button';
 import { Badge } from './components/ui/badge';
@@ -44,17 +48,46 @@ import {
   CommandSeparator,
 } from './components/ui/command';
 import { Logo, IconButton, Loading, EmptyState, SectionHeading, relativeTime } from './components/common';
-import { WorkspaceCanvas } from './components/workspace';
+import { AgentPanel, WorkspaceCanvas } from './components/workspace';
+import { LandingStudio } from './components/landing-studio';
+import { Warehouse } from './components/warehouse';
+import { ToolkitReference } from './components/toolkit-reference';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './components/ui/dialog';
 import { SettingsDialog, ConnectDialog } from './components/settings';
 import { cn } from './lib/utils';
 import { catalogRows, pageAncestors } from './lib/catalog';
 
-type Screen = 'home' | 'canvas' | 'changes' | 'activity';
+type Screen = 'home' | 'canvas' | 'landing' | 'warehouse' | 'toolkit' | 'changes' | 'activity';
+type FeatureAgent = {
+  instance: number;
+  target: { landingId: string } | { warehouse: true };
+  page: StorePage;
+  title: string;
+  sessionId: string | null;
+  prompt: string;
+};
+function featurePage(title: string, path = '/'): StorePage {
+  return {
+    title,
+    path,
+    parent: '',
+    description: null,
+    template: null,
+    itemTemplate: null,
+    visible: null,
+    search: 'unknown',
+    children: 0,
+    items: 0,
+    type: null,
+    catalogCopies: 0,
+  };
+}
 export function App() {
   const [data, setData] = useState<Bootstrap | null>(null);
   const [failure, setFailure] = useState('');
   const [screen, setScreen] = useState<Screen>('home');
   const [page, setPage] = useState('/');
+  const [slot, setSlot] = useState('body');
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -66,20 +99,30 @@ export function App() {
   const [sidebar, setSidebar] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [initialPrompt, setInitialPrompt] = useState('');
+  const [selectedLandingId, setSelectedLandingId] = useState<string>();
+  const [featureAgent, setFeatureAgent] = useState<FeatureAgent | null>(null);
   const sequence = useRef(0);
+  const workspaceIdentity = useRef('');
+  const featureSequence = useRef(0);
   const refresh = useCallback(async () => {
     const seq = ++sequence.current;
     try {
       const result = await invoke<Bootstrap>('bootstrap');
       if (seq !== sequence.current) return;
-      setData((previous) => {
-        if (previous && previous.workspace.id !== result.workspace.id) {
-          setPage(result.pages.some((p) => p.path === '/') ? '/' : result.pages[0]?.path || '/');
-          setActiveSession(null);
-          setSearch('');
-        }
-        return result;
-      });
+      const identity = JSON.stringify([result.workspace.id, result.workspace.selection.verifiedAt]);
+      if (workspaceIdentity.current && workspaceIdentity.current !== identity) {
+        setPage(result.pages.some((p) => p.path === '/') ? '/' : result.pages[0]?.path || '/');
+        setActiveSession(null);
+        setSlot('body');
+        setSelectedLandingId(undefined);
+        setFeatureAgent(null);
+        setInitialPrompt('');
+        setSearch('');
+        setExpanded(new Set());
+        setScreen('home');
+      }
+      workspaceIdentity.current = identity;
+      setData(result);
       setFailure('');
     } catch (error) {
       if (seq === sequence.current) setFailure(errorText(error));
@@ -132,20 +175,99 @@ export function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = data?.settings.theme || 'light';
   }, [data?.settings.theme]);
-  const openPage = (path: string) => {
+  const goTo = (next: Screen) => {
+    setFeatureAgent(null);
+    setScreen(next);
+  };
+  const openPage = (path: string, nextSlot = 'body') => {
     const known = new Set(data?.pages.map((p) => p.path) || []);
     setExpanded((previous) => new Set([...previous, ...pageAncestors(path, known)]));
     setPage(path);
+    setSlot(nextSlot);
     setScreen('canvas');
     setActiveSession(null);
     setInitialPrompt('');
+    setFeatureAgent(null);
+  };
+  const openFeature = (target: 'landing' | 'warehouse') => {
+    setFeatureAgent(null);
+    setScreen(target);
+    setInitialPrompt('');
+    setActiveSession(null);
+  };
+  const openLandingAgent = (project: LandingProject, prompt: string) => {
+    if (project.workspaceId !== data?.workspace.id) return;
+    const session = data.sessions.find(
+      (item) => item.target?.kind === 'landing' && item.target.projectId === project.id
+    );
+    setSelectedLandingId(project.id);
+    setScreen('landing');
+    setActiveSession(null);
+    setFeatureAgent({
+      instance: ++featureSequence.current,
+      target: { landingId: project.id },
+      page: featurePage(project.brief.title, project.brief.path),
+      title: project.brief.title,
+      sessionId: session?.id || null,
+      prompt,
+    });
+  };
+  const openWarehouseAgent = (prompt: string) => {
+    const session = data?.sessions.find((item) => item.target?.kind === 'warehouse');
+    setScreen('warehouse');
+    setActiveSession(null);
+    setFeatureAgent({
+      instance: ++featureSequence.current,
+      target: { warehouse: true },
+      page: featurePage('Data warehouse'),
+      title: 'Data warehouse',
+      sessionId: session?.id || null,
+      prompt,
+    });
   };
   const openSession = (session: Session) => {
+    if (session.workspaceId !== data?.workspace.id) return;
+    setInitialPrompt('');
+    if (session.target?.kind === 'landing') {
+      setSelectedLandingId(session.target.projectId);
+      setScreen('landing');
+      setActiveSession(null);
+      setFeatureAgent({
+        instance: ++featureSequence.current,
+        target: { landingId: session.target.projectId },
+        page: featurePage('Landing draft', session.scope.path),
+        title: session.title,
+        sessionId: session.id,
+        prompt: '',
+      });
+      return;
+    }
+    if (session.target?.kind === 'warehouse') {
+      setScreen('warehouse');
+      setActiveSession(null);
+      setFeatureAgent({
+        instance: ++featureSequence.current,
+        target: { warehouse: true },
+        page: featurePage('Data warehouse'),
+        title: session.title,
+        sessionId: session.id,
+        prompt: '',
+      });
+      return;
+    }
+    if (!data.pages.some((item) => item.path === session.scope.path)) {
+      toast.error('This page is not in the current catalog. Refresh the storefront before reopening it.');
+      return;
+    }
+    setFeatureAgent(null);
     setPage(session.scope.path);
+    setSlot(session.scope.slot);
     setActiveSession(session.id);
     setScreen('canvas');
   };
   const ask = (prompt: string) => {
+    setSlot('body');
+    setFeatureAgent(null);
     setPage(data?.pages.some((p) => p.path === '/') ? '/' : data?.pages[0]?.path || '/');
     setInitialPrompt(prompt);
     setScreen('canvas');
@@ -181,6 +303,7 @@ export function App() {
   const currentPage = data.pages.find((p) => p.path === page) || data.pages[0];
   const dirtyChanges = data.changes.filter((c) => c.draft.changedFields > 0 && c.status !== 'published');
   const rows = catalogRows(data.pages, search, expanded);
+  const commandKey = /Mac/i.test(navigator.platform) ? '⌘' : 'Ctrl';
   const isSample = data.workspace.kind === 'sample';
   return (
     <div className={cn('studio-app', !sidebar && 'sidebar-collapsed')}>
@@ -198,7 +321,7 @@ export function App() {
         <button className="titlebar-command" onClick={() => setPalette(true)}>
           <Search size={13} />
           <span>Search anything</span>
-          <kbd>⌘ K</kbd>
+          <kbd>{commandKey} K</kbd>
         </button>
       </header>
       <aside className="sidebar">
@@ -211,18 +334,39 @@ export function App() {
           <ChevronDown size={14} />
         </button>
         <nav className="main-nav" aria-label="Workspace navigation">
-          <button className={screen === 'home' ? 'active' : ''} onClick={() => setScreen('home')}>
+          <button className={screen === 'home' ? 'active' : ''} onClick={() => goTo('home')}>
             <Home /> Overview
           </button>
-          <button className={screen === 'canvas' ? 'active' : ''} onClick={() => setScreen('canvas')}>
+          <button className={screen === 'canvas' ? 'active' : ''} onClick={() => goTo('canvas')}>
             <LayoutGrid /> Storefront <span>{data.pages.length}</span>
           </button>
-          <button className={screen === 'changes' ? 'active' : ''} onClick={() => setScreen('changes')}>
+          <button
+            className={screen === 'landing' ? 'active' : ''}
+            aria-current={screen === 'landing' ? 'page' : undefined}
+            onClick={() => openFeature('landing')}
+          >
+            <PanelsTopLeft /> Landing Studio
+          </button>
+          <button
+            className={screen === 'warehouse' ? 'active' : ''}
+            aria-current={screen === 'warehouse' ? 'page' : undefined}
+            onClick={() => openFeature('warehouse')}
+          >
+            <Database /> Data warehouse
+          </button>
+          <button className={screen === 'changes' ? 'active' : ''} onClick={() => goTo('changes')}>
             <Layers3 /> Changes{' '}
             {dirtyChanges.length > 0 && <span className="nav-count">{dirtyChanges.length}</span>}
           </button>
-          <button className={screen === 'activity' ? 'active' : ''} onClick={() => setScreen('activity')}>
+          <button className={screen === 'activity' ? 'active' : ''} onClick={() => goTo('activity')}>
             <History /> Activity
+          </button>
+          <button
+            className={screen === 'toolkit' ? 'active' : ''}
+            aria-current={screen === 'toolkit' ? 'page' : undefined}
+            onClick={() => goTo('toolkit')}
+          >
+            <BookOpen /> Toolkit reference
           </button>
         </nav>
         <div className="sidebar-section-title">
@@ -298,9 +442,17 @@ export function App() {
                 <button
                   key={s.id}
                   onClick={() => openSession(s)}
-                  className={activeSession === s.id ? 'selected' : ''}
+                  className={activeSession === s.id || featureAgent?.sessionId === s.id ? 'selected' : ''}
                 >
-                  {s.status === 'working' ? <LoaderCircle className="spin" /> : <MessageSquare />}
+                  {s.status === 'working' ? (
+                    <LoaderCircle className="spin" />
+                  ) : s.target?.kind === 'warehouse' ? (
+                    <Database />
+                  ) : s.target?.kind === 'landing' ? (
+                    <PanelsTopLeft />
+                  ) : (
+                    <MessageSquare />
+                  )}
                   <span>{s.title}</span>
                 </button>
               ))}
@@ -311,7 +463,7 @@ export function App() {
           <div className="local-note">
             <ShieldCheck />
             <span>
-              Saved on this Mac<small>Your work stays with you.</small>
+              Saved on this computer<small>Drafts and conversation history.</small>
             </span>
           </div>
           <button className="settings-link" onClick={() => setSettings(true)}>
@@ -338,9 +490,15 @@ export function App() {
                   ? 'Overview'
                   : screen === 'canvas'
                     ? currentPage?.title || 'Storefront'
-                    : screen === 'changes'
-                      ? 'Changes'
-                      : 'Activity'}
+                    : screen === 'landing'
+                      ? 'Landing Studio'
+                      : screen === 'warehouse'
+                        ? 'Data warehouse'
+                        : screen === 'toolkit'
+                          ? 'Toolkit reference'
+                          : screen === 'changes'
+                            ? 'Changes'
+                            : 'Activity'}
               </b>
             </span>
           </div>
@@ -369,7 +527,9 @@ export function App() {
             openPage={openPage}
             ask={ask}
             connect={() => setConnect(true)}
-            openChanges={() => setScreen('changes')}
+            openChanges={() => goTo('changes')}
+            openLanding={() => openFeature('landing')}
+            openWarehouse={() => openFeature('warehouse')}
           />
         )}
         {screen === 'canvas' && currentPage && (
@@ -377,15 +537,33 @@ export function App() {
             key={data.workspace.id}
             data={data}
             page={currentPage}
+            slot={slot}
+            onSelectSlot={(next) => {
+              setSlot(next);
+              setActiveSession(null);
+              setInitialPrompt('');
+            }}
             activeSession={activeSession}
             setActiveSession={setActiveSession}
             initialPrompt={initialPrompt}
             clearInitialPrompt={() => setInitialPrompt('')}
-            overlayOpen={settings || connect || palette}
+            overlayOpen={settings || connect || palette || !!featureAgent}
             openSettings={() => setSettings(true)}
             refresh={refresh}
           />
         )}
+        {screen === 'landing' && (
+          <LandingStudio
+            key={data.workspace.id}
+            boot={data}
+            selectedId={selectedLandingId}
+            onAgent={openLandingAgent}
+          />
+        )}
+        {screen === 'warehouse' && (
+          <Warehouse key={data.workspace.id} boot={data} onAgent={openWarehouseAgent} onOpenPage={openPage} />
+        )}
+        {screen === 'toolkit' && <ToolkitReference boot={data} onSettings={() => setSettings(true)} />}
         {screen === 'changes' && <Changes changes={data.changes} openPage={openPage} />}
         {screen === 'activity' && (
           <div className="document-screen">
@@ -426,7 +604,67 @@ export function App() {
           </div>
         )}
       </main>
-      <SettingsDialog open={settings} onOpenChange={setSettings} data={data} refresh={refresh} />
+      <Dialog
+        open={!!featureAgent}
+        onOpenChange={(open) => {
+          if (!open) setFeatureAgent(null);
+        }}
+      >
+        <DialogContent className="feature-agent-dialog">
+          {featureAgent && (
+            <>
+              <DialogHeader className="feature-agent-header">
+                <div className="feature-agent-title-row">
+                  <span className="feature-agent-icon">
+                    {'landingId' in featureAgent.target ? (
+                      <PanelsTopLeft size={19} />
+                    ) : (
+                      <Database size={19} />
+                    )}
+                  </span>
+                  <div>
+                    <DialogTitle>
+                      {'landingId' in featureAgent.target ? 'Landing page agent' : 'Warehouse agent'}
+                    </DialogTitle>
+                    <span className="feature-agent-context">{featureAgent.title}</span>
+                  </div>
+                </div>
+                <DialogDescription>
+                  {'landingId' in featureAgent.target
+                    ? 'Work on the selected brief and local draft. Review saved changes in Landing Studio.'
+                    : 'Explore schemas and save SQL for review. Run queries explicitly in the warehouse controls.'}
+                </DialogDescription>
+              </DialogHeader>
+              <AgentPanel
+                key={`${data.workspace.id}:${featureAgent.instance}`}
+                data={data}
+                page={featureAgent.page}
+                target={featureAgent.target}
+                activeSession={featureAgent.sessionId}
+                setActiveSession={(id) =>
+                  setFeatureAgent((previous) =>
+                    previous?.instance === featureAgent.instance ? { ...previous, sessionId: id } : previous
+                  )
+                }
+                initialPrompt={featureAgent.prompt}
+                clearInitialPrompt={() =>
+                  setFeatureAgent((previous) =>
+                    previous?.instance === featureAgent.instance ? { ...previous, prompt: '' } : previous
+                  )
+                }
+                openSettings={() => setSettings(true)}
+              />
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+      <SettingsDialog
+        open={settings}
+        onOpenChange={setSettings}
+        data={data}
+        refresh={refresh}
+        initialTab={screen === 'toolkit' ? 'runtime' : undefined}
+      />
       <ConnectDialog open={connect} onOpenChange={setConnect} data={data} refresh={refresh} />
       <CommandDialog
         open={palette}
@@ -442,6 +680,24 @@ export function App() {
         <CommandList>
           <CommandEmpty>No results found.</CommandEmpty>
           <CommandGroup heading="Actions">
+            <CommandItem
+              value="landing studio pages create campaign brief draft"
+              onSelect={() => {
+                setPalette(false);
+                openFeature('landing');
+              }}
+            >
+              <PanelsTopLeft /> Open Landing Studio
+            </CommandItem>
+            <CommandItem
+              value="data warehouse sql bigquery analytics tables schema"
+              onSelect={() => {
+                setPalette(false);
+                openFeature('warehouse');
+              }}
+            >
+              <Database /> Explore data warehouse
+            </CommandItem>
             <CommandItem
               onSelect={() => {
                 setPalette(false);
@@ -463,7 +719,15 @@ export function App() {
             <CommandItem
               onSelect={() => {
                 setPalette(false);
-                setScreen('changes');
+                goTo('toolkit');
+              }}
+            >
+              <BookOpen /> Toolkit commands, capabilities, and skills
+            </CommandItem>
+            <CommandItem
+              onSelect={() => {
+                setPalette(false);
+                goTo('changes');
               }}
             >
               <Layers3 />
@@ -500,7 +764,13 @@ export function App() {
                     setPalette(false);
                   }}
                 >
-                  <MessageSquare />
+                  {s.target?.kind === 'warehouse' ? (
+                    <Database />
+                  ) : s.target?.kind === 'landing' ? (
+                    <PanelsTopLeft />
+                  ) : (
+                    <MessageSquare />
+                  )}
                   {s.title}
                 </CommandItem>
               ))}
@@ -518,12 +788,16 @@ function Overview({
   ask,
   connect,
   openChanges,
+  openLanding,
+  openWarehouse,
 }: {
   data: Bootstrap;
   openPage: (path: string) => void;
   ask: (prompt: string) => void;
   connect: () => void;
   openChanges: () => void;
+  openLanding: () => void;
+  openWarehouse: () => void;
 }) {
   const [prompt, setPrompt] = useState('');
   const changes = data.changes.filter((c) => c.draft.changedFields > 0);
@@ -542,7 +816,7 @@ function Overview({
           <br />
           <span>One thoughtful change at a time.</span>
         </h1>
-        <p>Explore your store. Work with your agent. Make every change count.</p>
+        <p>Shape your storefront. Build the next landing page. Learn from your data.</p>
       </div>
       <form
         className="hero-composer"
@@ -582,6 +856,30 @@ function Overview({
             </button>
           )
         )}
+      </div>
+      <div className="studio-feature-grid">
+        <button className="studio-feature-card landing" onClick={openLanding}>
+          <span className="studio-feature-icon">
+            <PanelsTopLeft size={21} />
+          </span>
+          <span>
+            <small>FROM BRIEF TO DRAFT</small>
+            <strong>Landing Studio</strong>
+            <p>Build a local page with editable sections and your agent.</p>
+          </span>
+          <ArrowUpRight size={17} />
+        </button>
+        <button className="studio-feature-card warehouse" onClick={openWarehouse}>
+          <span className="studio-feature-icon">
+            <Database size={21} />
+          </span>
+          <span>
+            <small>FOLLOW THE EVIDENCE</small>
+            <strong>Data warehouse</strong>
+            <p>Inspect your schema, review a query, and explore the results.</p>
+          </span>
+          <ArrowUpRight size={17} />
+        </button>
       </div>
       <div className="overview-metrics">
         <button onClick={() => openPage(data.pages[0]?.path || '/')}>
@@ -698,7 +996,13 @@ function Overview({
     </div>
   );
 }
-function Changes({ changes, openPage }: { changes: Change[]; openPage: (path: string) => void }) {
+function Changes({
+  changes,
+  openPage,
+}: {
+  changes: Change[];
+  openPage: (path: string, slot?: string) => void;
+}) {
   return (
     <div className="document-screen">
       <SectionHeading
@@ -711,14 +1015,18 @@ function Changes({ changes, openPage }: { changes: Change[]; openPage: (path: st
       {changes.length ? (
         <div className="change-list">
           {changes.map((c) => (
-            <button key={c.id} className="change-list-row" onClick={() => openPage(c.scope.path)}>
+            <button
+              key={c.id}
+              className="change-list-row"
+              onClick={() => openPage(c.scope.path, c.scope.slot)}
+            >
               <span className="change-row-icon">
                 <Layers3 />
               </span>
               <div>
                 <strong>{c.scope.path === '/' ? 'Homepage' : c.scope.path}</strong>
                 <p>
-                  {c.draft.changedFields} edited fields · Revision {c.draft.revision} ·{' '}
+                  {c.draft.changedFields} content and structure changes · Revision {c.draft.revision} ·{' '}
                   {relativeTime(c.draft.updatedAt)}
                 </p>
               </div>

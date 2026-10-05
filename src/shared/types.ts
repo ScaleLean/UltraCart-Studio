@@ -37,6 +37,7 @@ export type Session = {
   createdAt: string;
   updatedAt: string;
   error?: string;
+  target?: { kind: 'landing'; projectId: string } | { kind: 'warehouse' };
 };
 export type Message = {
   id: string;

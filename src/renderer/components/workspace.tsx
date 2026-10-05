@@ -68,6 +68,9 @@ import { Alert, AlertDescription, AlertTitle } from './ui/alert';
 import { EmptyState, IconButton, Loading, relativeTime } from './common';
 import { SamplePreview } from './sample-preview';
 import { TemplateSourceDialog } from './template-source';
+import { PageBuilder } from './page-builder';
+import { ContentMap } from './content-map';
+import { NativeIdsDialog } from './native-ids';
 
 const emptyView: ConversationView = { messages: [], busy: false, queued: 0, tokens: 0 };
 const toolNames: Record<string, string> = {
@@ -79,10 +82,24 @@ const toolNames: Record<string, string> = {
   storefront_read_draft: 'Read current draft',
   storefront_save_draft: 'Save local edits',
   storefront_review_draft: 'Validate and review',
+  storefront_inspect_structure: 'Read page structure',
+  storefront_content_map: 'Inspect page content sources',
+  storefront_edit_structure: 'Edit page sections',
+  landing_read_project: 'Read landing draft',
+  landing_save_fields: 'Save landing copy',
+  landing_edit_sections: 'Edit landing sections',
+  landing_update_brief: 'Update landing brief',
+  landing_check_readiness: 'Check landing draft',
+  warehouse_status: 'Read warehouse status',
+  warehouse_list_tables: 'Explore warehouse tables',
+  warehouse_read_schema: 'Read table schema',
+  warehouse_save_query: 'Save query for review',
 };
 type Props = {
   data: Bootstrap;
   page: StorePage;
+  slot?: string;
+  onSelectSlot?: (slot: string) => void;
   activeSession: string | null;
   setActiveSession: (id: string | null) => void;
   initialPrompt: string;
@@ -95,6 +112,7 @@ type Props = {
 export function WorkspaceCanvas({
   data,
   page,
+  slot = 'body',
   activeSession,
   setActiveSession,
   initialPrompt,
@@ -102,6 +120,7 @@ export function WorkspaceCanvas({
   overlayOpen,
   openSettings,
   refresh,
+  onSelectSlot,
 }: Props) {
   const [mode, setMode] = useState('preview');
   const [device, setDevice] = useState('desktop');
@@ -112,19 +131,21 @@ export function WorkspaceCanvas({
   });
   const [action, setAction] = useState('');
   const [selectedField, setSelectedField] = useState('');
+  const [sectionPrompt, setSectionPrompt] = useState('');
   const [rightVisible, setRightVisible] = useState(true);
   const [publishOpen, setPublishOpen] = useState(false);
   const [confirmation, setConfirmation] = useState('');
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [idsOpen, setIdsOpen] = useState(false);
   const [history, setHistory] = useState<{ revision: number; at: string; changedFields: number }[]>([]);
   const [templates, setTemplates] = useState<TemplateResult | null>(null);
   const [source, setSource] = useState<TemplateSource | null>(null);
   const viewport = useRef<HTMLDivElement>(null);
   const mounted = useRef(true);
-  const change = data.changes.find((c) => c.scope.path === page.path);
+  const change = data.changes.find((c) => c.scope.path === page.path && c.scope.slot === slot);
   const draft = change?.draft;
   const sample = data.workspace.kind === 'sample';
-  const isOverlay = overlayOpen || publishOpen || historyOpen || !!source;
+  const isOverlay = overlayOpen || publishOpen || historyOpen || idsOpen || !!source;
   const currentPath = useRef(page.path);
   currentPath.current = page.path;
   useEffect(() => {
@@ -138,6 +159,7 @@ export function WorkspaceCanvas({
     setTemplates(null);
     setSource(null);
     setSelectedField('');
+    setSectionPrompt('');
     setNativeStatus({ loading: false });
     setDraftPreview(true);
     setMode('preview');
@@ -178,7 +200,7 @@ export function WorkspaceCanvas({
     }
     setNativeStatus({ loading: true });
     let cancelled = false;
-    void invoke('preview.open', { kind: 'live', path: page.path })
+    void invoke('preview.open', { kind: 'live', path: page.path, slot })
       .then(() => {
         if (!cancelled) updateBounds();
       })
@@ -202,7 +224,7 @@ export function WorkspaceCanvas({
   }
   async function pull() {
     await run('pull', async () => {
-      await invoke('draft.pull', { path: page.path });
+      await invoke('draft.pull', { path: page.path, slot });
       setPanel('fields');
       toast.success('Local draft opened');
     });
@@ -210,7 +232,7 @@ export function WorkspaceCanvas({
   async function review() {
     if (!draft) return;
     await run('review', async () => {
-      await invoke('draft.review', { path: page.path, id: draft.id, revision: draft.revision });
+      await invoke('draft.review', { path: page.path, slot, id: draft.id, revision: draft.revision });
       setMode('changes');
       toast.success('Draft review complete');
     });
@@ -228,6 +250,7 @@ export function WorkspaceCanvas({
       await invoke('preview.open', {
         kind: 'draft',
         path: page.path,
+        slot,
         id: draft.id,
         revision: draft.revision,
       });
@@ -237,7 +260,7 @@ export function WorkspaceCanvas({
   async function loadHistory() {
     if (!draft) return;
     try {
-      setHistory(await invoke('draft.history', { path: page.path, id: draft.id }));
+      setHistory(await invoke('draft.history', { path: page.path, slot, id: draft.id }));
       setHistoryOpen(true);
     } catch (error) {
       toast.error(errorText(error));
@@ -265,6 +288,7 @@ export function WorkspaceCanvas({
             </div>
           </div>
           <div>
+            <Badge variant="outline">Slot: {slot}</Badge>
             {draft && <Badge variant="secondary">{draft.changedFields} changes</Badge>}
             <IconButton
               label="Page details"
@@ -294,6 +318,14 @@ export function WorkspaceCanvas({
                 <GitCompareArrows />
                 Changes
               </ToggleGroupItem>
+              <ToggleGroupItem value="sections" aria-label="Sections">
+                <Layers3 />
+                Sections
+              </ToggleGroupItem>
+              <ToggleGroupItem value="content" aria-label="Content sources">
+                <FileCode2 />
+                Content
+              </ToggleGroupItem>
             </ToggleGroup>
           </div>
           <div>
@@ -317,7 +349,7 @@ export function WorkspaceCanvas({
               onClick={() =>
                 sample
                   ? toast.info('This is a local sample storefront.')
-                  : void invoke('window.openStore', { path: page.path }).catch((e) =>
+                  : void invoke('window.openStore', { path: page.path, slot }).catch((e) =>
                       toast.error(errorText(e))
                     )
               }
@@ -365,7 +397,10 @@ export function WorkspaceCanvas({
                   />
                 ) : nativeStatus.error ? (
                   <EmptyState title="Preview unavailable" description={nativeStatus.error}>
-                    <Button variant="outline" onClick={() => invoke('window.openStore', { path: page.path })}>
+                    <Button
+                      variant="outline"
+                      onClick={() => invoke('window.openStore', { path: page.path, slot })}
+                    >
                       Open in browser
                       <ArrowUpRight data-icon="inline-end" />
                     </Button>
@@ -396,6 +431,34 @@ export function WorkspaceCanvas({
               )}
             </div>
           </div>
+        ) : mode === 'content' ? (
+          <ContentMap
+            key={data.workspace.id + ':' + page.path}
+            path={page.path}
+            slot={slot}
+            onSelectSlot={(next) => {
+              onSelectSlot?.(next);
+              setSelectedField('');
+              setSectionPrompt('');
+              setMode('sections');
+            }}
+          />
+        ) : mode === 'sections' ? (
+          <PageBuilder
+            key={data.workspace.id + ':' + page.path + ':' + slot}
+            path={page.path}
+            slot={slot}
+            revision={draft?.revision}
+            disabled={!!action || !!change?.publishedAt || !!change?.publishPending}
+            onChange={refresh}
+            onSelectSection={(node) => {
+              setPanel('agent');
+              setRightVisible(true);
+              setSectionPrompt(
+                `Inspect the section "${node.title}" (node ID: ${node.id}) in this page's local draft. Suggest one specific improvement based on its current content.`
+              );
+            }}
+          />
         ) : (
           <div className="diff-canvas">
             {draft ? (
@@ -408,6 +471,20 @@ export function WorkspaceCanvas({
                   <Badge variant="outline">Revision {draft.revision}</Badge>
                 </div>
                 {change?.review && <ReviewStatus change={change} />}
+                {!!draft.structureChanges?.length && (
+                  <div className="mb-5 rounded-lg border border-border bg-muted/30 p-4">
+                    <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+                      <Layers3 size={14} />
+                      Section changes
+                    </h3>
+                    {draft.structureChanges.map((change) => (
+                      <div key={change.kind + change.id} className="flex items-center gap-2 py-1 text-sm">
+                        <Badge variant="outline">{change.kind}</Badge>
+                        <span className="min-w-0 truncate">{change.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div className="diff-column-labels">
                   <span>ORIGINAL</span>
                   <span>YOUR DRAFT</span>
@@ -468,6 +545,7 @@ export function WorkspaceCanvas({
                       run('next', async () => {
                         await invoke('draft.next', {
                           path: page.path,
+                          slot,
                           id: draft.id,
                           revision: draft.revision,
                         });
@@ -487,6 +565,7 @@ export function WorkspaceCanvas({
                       run('verify', async () => {
                         await invoke('draft.verify', {
                           path: page.path,
+                          slot,
                           id: draft.id,
                           revision: draft.revision,
                         });
@@ -495,6 +574,16 @@ export function WorkspaceCanvas({
                     }
                   >
                     Verify publish
+                  </Button>
+                )}
+                {!sample && !!draft.localWidgetCount && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!!action || !!change?.publishedAt || !!change?.publishPending}
+                    onClick={() => setIdsOpen(true)}
+                  >
+                    Prepare IDs
                   </Button>
                 )}
                 <Button size="sm" variant="outline" disabled={!!action} onClick={review}>
@@ -570,10 +659,14 @@ export function WorkspaceCanvas({
             <AgentPanel
               data={data}
               page={page}
+              slot={slot}
               activeSession={activeSession}
               setActiveSession={setActiveSession}
-              initialPrompt={initialPrompt}
-              clearInitialPrompt={clearInitialPrompt}
+              initialPrompt={sectionPrompt || initialPrompt}
+              clearInitialPrompt={() => {
+                setSectionPrompt('');
+                clearInitialPrompt();
+              }}
               openSettings={openSettings}
             />
           )}
@@ -589,7 +682,7 @@ export function WorkspaceCanvas({
             ) : (
               <EmptyState
                 title="Make it yours"
-                description="Open a local draft to edit the existing strings in this page's body container."
+                description={`Open a local draft to edit this page’s ${slot} slot. Use Content to find available slots.`}
               >
                 <Button onClick={pull} disabled={!!action}>
                   Open local draft
@@ -629,7 +722,7 @@ export function WorkspaceCanvas({
                   disabled={!!action}
                   onClick={() =>
                     run('templates', async () =>
-                      setTemplates(await invoke('page.templates', { path: page.path }))
+                      setTemplates(await invoke('page.templates', { path: page.path, slot }))
                     )
                   }
                 >
@@ -662,12 +755,12 @@ export function WorkspaceCanvas({
                 <span className="eyebrow">LOCAL DRAFT</span>
                 <p>
                   {draft
-                    ? `${draft.fields.length} editable fields. ${draft.changedFields} changed. ${draft.skippedFields} omitted by size limits.`
+                    ? `${draft.fields.length} editable fields. ${draft.changedTextFields ?? draft.changedFields} changed. ${draft.skippedFields} omitted by size limits.`
                     : 'No local draft opened yet.'}
                 </p>
                 {draft && (
                   <p>
-                    Body container: <code>{draft.container}</code>
+                    Container: <code>{draft.container}</code>
                   </p>
                 )}
                 {draft && (
@@ -677,6 +770,7 @@ export function WorkspaceCanvas({
                     onClick={() =>
                       invoke('draft.export', {
                         path: page.path,
+                        slot,
                         id: draft.id,
                         revision: draft.revision,
                       }).catch((e) => toast.error(errorText(e)))
@@ -690,6 +784,15 @@ export function WorkspaceCanvas({
             </div>
           )}
         </aside>
+      )}
+      {idsOpen && draft && (
+        <NativeIdsDialog
+          key={`${draft.id}:${draft.revision}`}
+          draft={draft}
+          host={data.workspace.selection.storefront.host}
+          onClose={() => setIdsOpen(false)}
+          onSaved={refresh}
+        />
       )}
       {source && <TemplateSourceDialog source={source} onClose={() => setSource(null)} />}
       <Dialog open={publishOpen} onOpenChange={setPublishOpen}>
@@ -723,6 +826,7 @@ export function WorkspaceCanvas({
                 run('publish', async () => {
                   await invoke('draft.publish', {
                     path: page.path,
+                    slot,
                     id: draft!.id,
                     revision: draft!.revision,
                     confirmation,
@@ -753,7 +857,7 @@ export function WorkspaceCanvas({
                 <div>
                   <strong>{item.revision === 1 ? 'Original baseline' : `Revision ${item.revision}`}</strong>
                   <small>
-                    {item.changedFields} changed fields · {relativeTime(item.at)}
+                    {item.changedFields} changes · {relativeTime(item.at)}
                   </small>
                 </div>
                 <Button
@@ -764,6 +868,7 @@ export function WorkspaceCanvas({
                     run('restore', async () => {
                       await invoke('draft.restore', {
                         path: page.path,
+                        slot,
                         id: draft!.id,
                         revision: item.revision,
                       });
@@ -806,20 +911,68 @@ function ReviewStatus({ change }: { change: Change }) {
   );
 }
 
-function AgentPanel({
+export function AgentPanel({
   data,
   page,
+  slot = 'body',
   activeSession,
   setActiveSession,
   initialPrompt,
   clearInitialPrompt,
   openSettings,
-}: Omit<Props, 'overlayOpen' | 'refresh'>) {
+  target,
+}: Omit<Props, 'overlayOpen' | 'refresh'> & { target?: { landingId: string } | { warehouse: true } }) {
   const [view, setView] = useState<ConversationView>(emptyView);
   const [text, setText] = useState(initialPrompt);
   const [sending, setSending] = useState(false);
   const [steer, setSteer] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
+  const warehouse = !!target && 'warehouse' in target;
+  const landing = !!target && 'landingId' in target;
+  const suggestions = warehouse
+    ? [
+        [
+          'Explore this warehouse',
+          'Read the warehouse status and table metadata. Explain what questions the available data can answer. Do not run a query.',
+        ],
+        [
+          'Draft a revenue query',
+          'Inspect actual table schemas and save a query that summarizes recent revenue by day. Use verified fields and an explicit date range. Do not run it.',
+        ],
+        [
+          'Find pages to improve',
+          'Inspect available schemas and save a query to identify high-traffic pages with weak conversion if those measures exist. Explain metric definitions and limits. Do not invent fields or run a query.',
+        ],
+      ]
+    : landing
+      ? [
+          [
+            'Refine this landing page',
+            'Read the landing brief and sections. Improve the copy and section order to support the stated goal. Preserve verified facts and keep unresolved claims as placeholders. Save the local draft.',
+          ],
+          [
+            'Improve the opening',
+            'Read this landing project and improve its opening section for the stated audience and offer. Save the local draft and check readiness.',
+          ],
+          [
+            'Review the full page',
+            'Review the landing brief and every section. Identify missing facts, unclear actions, and unsupported claims. Explain the highest-value improvements.',
+          ],
+        ]
+      : [
+          [
+            'Understand this page',
+            'Inspect this page and explain its structure, shared templates, and opportunities.',
+          ],
+          [
+            'Make the copy clearer',
+            'Improve the clarity of this page’s existing copy. Preserve product facts and claims. Save a local draft and review your edits.',
+          ],
+          [
+            'Plan a thoughtful change',
+            'Inspect this page and propose one concrete improvement. Explain the evidence and tradeoffs before editing.',
+          ],
+        ];
   useEffect(() => {
     if (initialPrompt) {
       setText(initialPrompt);
@@ -854,7 +1007,8 @@ function AgentPanel({
     }
     setSending(true);
     try {
-      const id = activeSession || (await invoke<Session>('session.create', { path: page.path })).id;
+      const id =
+        activeSession || (await invoke<Session>('session.create', target ?? { path: page.path, slot })).id;
       if (!activeSession) setActiveSession(id);
       await invoke('session.send', { id, text: text.trim(), requestId: crypto.randomUUID(), steer });
       setText('');
@@ -869,7 +1023,13 @@ function AgentPanel({
       <div className="agent-panel-heading">
         <span>
           <i className={cn('status-dot', !view.busy && 'neutral')} />
-          {view.busy ? 'Working on your page' : 'Your storefront partner'}
+          {view.busy
+            ? warehouse
+              ? 'Exploring your data'
+              : 'Working on your page'
+            : warehouse
+              ? 'Your warehouse assistant'
+              : 'Your storefront partner'}
         </span>
         <IconButton
           label="New conversation"
@@ -891,22 +1051,15 @@ function AgentPanel({
               A little direction.
               <br />A lot of possibility.
             </h2>
-            <p>I can explore this page, refine its content, and prepare a change for you to review.</p>
+            <p>
+              {warehouse
+                ? 'Explore your schemas and prepare SQL you can inspect, estimate, and run.'
+                : landing
+                  ? 'Turn your brief into clear sections and copy, saved in your local landing draft.'
+                  : 'I can explore this page, refine its content, and prepare a change for you to review.'}
+            </p>
             <div className="agent-suggestions">
-              {[
-                [
-                  'Understand this page',
-                  'Inspect this page and explain its structure, shared templates, and opportunities.',
-                ],
-                [
-                  'Make the copy clearer',
-                  'Improve the clarity of this page’s existing copy. Preserve product facts and claims. Save a local draft and review your edits.',
-                ],
-                [
-                  'Plan a thoughtful change',
-                  'Inspect this page and propose one concrete improvement. Explain the evidence and tradeoffs before editing.',
-                ],
-              ].map(([label, prompt]) => (
+              {suggestions.map(([label, prompt]) => (
                 <button key={label} onClick={() => setText(prompt)}>
                   <Sparkles size={13} />
                   <span>{label}</span>
@@ -915,7 +1068,8 @@ function AgentPanel({
               ))}
             </div>
             <span className="agent-welcome-note">
-              <ShieldCheck size={12} /> Your agent edits local drafts.
+              <ShieldCheck size={12} />{' '}
+              {warehouse ? 'You review and run saved queries.' : 'Your agent edits local drafts.'}
             </span>
           </div>
         ) : (
@@ -934,7 +1088,7 @@ function AgentPanel({
       <div className="composer-area">
         <div className="scope-chip">
           <FileText size={12} />
-          <span>{page.path === '/' ? 'Homepage' : page.path}</span>
+          <span>{warehouse ? 'Data warehouse' : page.path === '/' ? 'Homepage' : page.path}</span>
           <span>Pinned context</span>
         </div>
         <div className="agent-composer">
@@ -1105,6 +1259,7 @@ function DraftEditor({
     try {
       const result = await invoke<Draft>('draft.save', {
         path,
+        slot: draft.slot,
         id: draft.id,
         revision: baseRevision,
         edits: draft.fields

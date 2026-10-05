@@ -2979,3 +2979,179 @@ kbd {
   opacity: 0.65;
   margin-top: 2px;
 }
+
+/* Feature entry points and the shared agent conversation dialog. */
+.studio-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px;
+  margin: 25px 0 22px;
+}
+.studio-feature-card {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  text-align: left;
+  min-height: 110px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  color: var(--foreground);
+  background: var(--card);
+  transition:
+    border-color 160ms,
+    background 160ms;
+}
+.studio-feature-card:hover {
+  border-color: color-mix(in srgb, var(--primary) 32%, var(--border));
+  background: var(--soft-purple);
+}
+.studio-feature-card > span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
+}
+.studio-feature-card > svg {
+  color: var(--muted-foreground);
+  align-self: flex-start;
+  margin-top: 3px;
+}
+.studio-feature-icon {
+  width: 43px;
+  height: 43px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  background: var(--secondary);
+  color: var(--primary);
+}
+.studio-feature-card.warehouse .studio-feature-icon {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 9%, var(--card));
+}
+.studio-feature-card small {
+  display: block;
+  font-size: 7px;
+  color: var(--muted-foreground);
+  letter-spacing: 1.2px;
+  font-weight: 600;
+  margin-bottom: 7px;
+}
+.studio-feature-card strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 550;
+  letter-spacing: -0.2px;
+}
+.studio-feature-card p {
+  margin: 6px 0 0;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--muted-foreground);
+}
+.feature-agent-dialog[data-slot='dialog-content'] {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  width: min(620px, calc(100vw - 48px));
+  max-width: 620px;
+  height: min(800px, calc(100vh - 70px));
+  max-height: calc(100vh - 70px);
+  border-radius: 15px;
+  overflow: hidden;
+}
+.feature-agent-header[data-slot='dialog-header'] {
+  padding: 22px 48px 18px 24px;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(120deg, var(--soft-purple), var(--background));
+  flex-shrink: 0;
+}
+.feature-agent-title-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.feature-agent-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  color: var(--primary);
+  background: var(--secondary);
+  flex-shrink: 0;
+}
+.feature-agent-title-row > div {
+  min-width: 0;
+}
+.feature-agent-title-row [data-slot='dialog-title'] {
+  font-size: 16px;
+  font-weight: 550;
+  letter-spacing: -0.35px;
+}
+.feature-agent-context {
+  display: block;
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.feature-agent-header [data-slot='dialog-description'] {
+  font-size: 11px;
+  line-height: 1.65;
+  max-width: 465px;
+}
+.feature-agent-dialog .agent-panel {
+  overflow: hidden;
+}
+.feature-agent-dialog .agent-panel-heading {
+  padding: 14px 18px 8px 23px;
+}
+.feature-agent-dialog .conversation-scroll {
+  padding: 0 24px;
+}
+.feature-agent-dialog .agent-welcome {
+  padding: 26px 7px 20px;
+}
+.feature-agent-dialog .agent-welcome h2 {
+  font-size: 24px;
+}
+.feature-agent-dialog .composer-area {
+  padding-right: 20px;
+  padding-left: 20px;
+}
+.sidebar {
+  overflow-y: auto;
+}
+.main-nav {
+  flex-shrink: 0;
+}
+@media (max-width: 1150px) {
+  .studio-feature-card {
+    padding: 14px;
+    gap: 10px;
+  }
+  .studio-feature-icon {
+    width: 34px;
+    height: 37px;
+  }
+}
+@media (max-height: 850px) {
+  .sidebar-section-title {
+    margin-top: 12px;
+  }
+  .session-list {
+    max-height: 92px;
+    flex-shrink: 0;
+  }
+  .sidebar-bottom {
+    margin-top: 12px;
+  }
+  .sidebar .local-note {
+    display: none;
+  }
+}

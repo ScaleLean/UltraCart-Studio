@@ -1,0 +1,113 @@
+name: Desktop release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+          - runner: windows-2022
+            platform: win32
+            arch: x64
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Verify native runner
+        env:
+          STUDIO_TARGET_PLATFORM: ${{ matrix.platform }}
+          STUDIO_TARGET_ARCH: ${{ matrix.arch }}
+        run: node -e "if (process.platform !== process.env.STUDIO_TARGET_PLATFORM || process.arch !== process.env.STUDIO_TARGET_ARCH) throw new Error('The package must use its native runner'); console.log(process.platform, process.arch)"
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - name: Build native portable package
+        run: npm run package
+      - name: Check packaged sample worker and SQLite persistence
+        run: npm run package:smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ultracart-studio-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            release/UltraCart-Studio-*.zip
+            release/UltraCart-Studio-*.tar.gz
+            release/UltraCart-Studio-*.sha256
+            release/UltraCart-Studio-*.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish verified release assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ultracart-studio-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify all three archives
+        working-directory: release-assets
+        run: |
+          test "$(find . -maxdepth 1 -name '*.sha256' | wc -l)" -eq 3
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create release only after every native build passes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'NOTES'
+          UltraCart Studio desktop packages for macOS Apple Silicon, Windows x64, and Linux x64, including Omarchy.
+
+          This release adds the page structure editor and content map, Landing Studio preparation, native widget-ID reservation, warehouse exploration and local result charts, warehouse connection diagnostics, and the searchable toolkit capability and skill reference. See the [changelog](https://github.com/ScaleLean/UltraCart-Studio/blob/main/CHANGELOG.md).
+
+          Download the archive for your platform and its SHA-256 file. Each archive contains installation instructions, licenses, and build metadata. The Electron runtime is included. The private UltraCart toolkit and merchant credentials are not included.
+
+          These builds are not developer-signed or notarized. They have passed source checks, fixture tests, and a native packaged-worker/SQLite smoke check. That check does not establish full desktop, OAuth, keyring, or live merchant compatibility on every platform. Linux credential persistence requires an unlocked Secret Service keyring; the included Omarchy launcher selects that backend.
+
+          See [installation instructions](https://github.com/ScaleLean/UltraCart-Studio/blob/main/docs/install.md). No live merchant writes run during this workflow.
+          NOTES
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > release-draft.txt 2>/dev/null; then
+            test "$(cat release-draft.txt)" = true || { echo 'Refusing to replace assets on an already published release.' >&2; exit 1; }
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "UltraCart Studio $RELEASE_TAG" --notes-file release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease
+          else
+            gh release edit "$RELEASE_TAG" --draft=false
+          fi

@@ -42,8 +42,9 @@ type DialogProps = {
   onOpenChange: (open: boolean) => void;
   data: Bootstrap;
   refresh: () => Promise<void>;
+  initialTab?: 'agent' | 'runtime' | 'appearance';
 };
-export function SettingsDialog({ open, onOpenChange, data, refresh }: DialogProps) {
+export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }: DialogProps) {
   const [settings, setSettings] = useState<Settings>(data.settings);
   const [tab, setTab] = useState('agent');
   const [busy, setBusy] = useState(false);
@@ -52,8 +53,9 @@ export function SettingsDialog({ open, onOpenChange, data, refresh }: DialogProp
     if (open) {
       setSettings(data.settings);
       setAnswer('');
+      if (initialTab) setTab(initialTab);
     }
-  }, [open]);
+  }, [open, initialTab]);
   async function save(next = settings) {
     setBusy(true);
     try {
@@ -142,7 +144,7 @@ export function SettingsDialog({ open, onOpenChange, data, refresh }: DialogProp
                         <strong>{data.auth.connected ? 'ChatGPT connected' : 'Connect your account'}</strong>
                         <small>
                           {data.auth.connected
-                            ? 'Credentials are encrypted on this Mac.'
+                            ? 'Credentials are encrypted on this computer.'
                             : 'Sign in through your browser.'}
                         </small>
                       </span>

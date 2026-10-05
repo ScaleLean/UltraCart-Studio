@@ -44,6 +44,11 @@ const draftSchema = z.object({
   fields: z.array(fieldSchema),
   skippedFields: z.number().int(),
   changedFields: z.number().int(),
+  changedTextFields: z.number().int().optional(),
+  structureChanges: z
+    .array(z.object({ kind: z.enum(['added', 'removed', 'moved']), id: z.string(), label: z.string() }))
+    .optional(),
+  localWidgetCount: z.number().int().nonnegative().optional(),
 });
 export type Draft = z.infer<typeof draftSchema>;
 const scopedId = draftScopeSchema.extend({ id: z.string().uuid() });

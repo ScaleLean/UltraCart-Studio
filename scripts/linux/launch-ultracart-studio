@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+studio_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Omarchy uses Hyprland. Select its Secret Service backend explicitly.
+exec "$studio_directory/ultracart-studio" --password-store=gnome-libsecret "$@"

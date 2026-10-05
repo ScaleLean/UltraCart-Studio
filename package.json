@@ -1,7 +1,7 @@
 {
   "name": "ultracart-studio",
   "productName": "UltraCart Studio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A local workspace for building and reviewing UltraCart storefront changes with durable agents.",
   "license": "MIT",
   "author": "Scale Lean",
@@ -26,6 +26,8 @@
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "package": "npm run build && node scripts/package.mjs",
+    "package:dir": "npm run build && node scripts/package.mjs --no-archive",
+    "package:smoke": "node scripts/package-smoke.mjs",
     "format": "prettier --write src tests scripts/*.mjs *.json *.ts"
   },
   "dependencies": {

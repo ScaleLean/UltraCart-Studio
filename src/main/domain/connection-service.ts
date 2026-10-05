@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { isAbsolute, dirname } from 'node:path';
+import { isAbsolute, dirname, delimiter } from 'node:path';
 import { homedir } from 'node:os';
 import { access } from 'node:fs/promises';
 import { constants } from 'node:fs';
@@ -62,6 +62,15 @@ export function safeFailure(text: string) {
     return 'UltraCart rate limited the request. Wait at least one minute before retrying.';
   if (/locked|keychain|credential store|native_binding/i.test(text))
     return 'The OS credential store is unavailable or locked. Unlock it, then try again.';
+  if (
+    /\bHTTP(?:\/[\d.]+)?\s+403\b|\b403\s+Forbidden\b|\b(?:httpStatus|status(?:Code)?)["']?\s*[:=]\s*["']?403\b/i.test(
+      text
+    ) ||
+    /\brequires?\s+(?:read|write|publish)(?:\s+and\s+(?:read|write|publish))?\s+permission\b|\bsfvb\.(?:read|write|publish)_scope_required\b/i.test(
+      text
+    )
+  )
+    return 'The selected profile does not have permission for this request. Check its UltraCart permissions.';
   if (/access_denied|authorization_declined/i.test(text))
     return 'Authorization was declined. You can start again when ready.';
   if (/expired_token|expired/i.test(text)) return 'The sign-in request expired. Start a new sign-in.';
@@ -69,6 +78,45 @@ export function safeFailure(text: string) {
     return 'This profile needs sign-in. Authorize it in UltraCart, then retry.';
   if (/merchant.*mismatch|identity.*mismatch/i.test(text))
     return 'The merchant does not match this profile. Choose the correct profile or sign in with a new profile name.';
+  // An identity failure may also mention the requested file. It must take precedence.
+  if (
+    /\bsfvb\.invalid_storefront\b|\b(?:unknown|missing)\s+(?:storefront|merchant|profile|identity|account)\b/i.test(
+      text
+    ) ||
+    /\bno\s+(?:storefront|merchant|profile|identity|account)\b[^\r\n]{0,160}\bexists?\b/i.test(text) ||
+    /\b(?:storefront|merchant|profile|identity|account)(?:\s+(?:["'][^"'\r\n]{1,80}["']|\[[^\]\r\n]{1,80}\]|[\w.-]{1,64}))?\s+(?:was\s+|is\s+)?(?:not found|does not exist|unavailable)\b/i.test(
+      text
+    ) ||
+    /\bstorefront\b[^\r\n]{0,160}\bis not on profile\b/i.test(text)
+  )
+    return 'The selected profile, merchant, or storefront could not be found. Check the connection selection.';
+  if (
+    /\b(?:invalid|malformed)\s+CJSON\b|\bnot\s+(?:a\s+)?(?:valid\s+)?CJSON\b|\bCJSON\s+(?:is\s+)?(?:invalid|malformed|validation failed)\b/i.test(
+      text
+    ) ||
+    /\bPush supports container documents only\b|\bEvery widget must have a unique nonempty ID\b|\bchildWidgets must contain only widget objects\b/i.test(
+      text
+    )
+  )
+    return 'The container is not valid CJSON. Inspect its structure before editing.';
+  const missingContent =
+    /\b(?:file|container|slot|path)\b[^\r\n]{0,160}\b(?:not found|does not exist|doesn't exist)\b/i.test(
+      text
+    ) ||
+    /\b(?:no such|cannot find|could not find)\s+(?:the\s+)?(?:remote\s+)?(?:file|container|slot|path)\b/i.test(
+      text
+    ) ||
+    /\bno\s+(?:file|container|slot|path)\b[^\r\n]{0,160}\bexists?\b/i.test(text) ||
+    text
+      .split(/\r?\n/)
+      .some(
+        (line) =>
+          /\bHTTP(?:\/[\d.]+)?\s+404\b|\b404\s+Not Found\b|\b(?:httpStatus|status(?:Code)?)["']?\s*[:=]\s*["']?404\b/i.test(
+            line
+          ) && /(?:^|[\s"'[(=:])\/[^\s"'<>]{1,2048}\.cjson\b/i.test(line)
+      );
+  if (missingContent && !/\b(?:ENOENT|ENOTDIR|MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND)\b/i.test(text))
+    return 'This page body or slot does not exist. Inspect the resolved template to find its content.';
   return 'The toolkit could not complete the request. Check the selected profile, network, and installed toolkit, then retry.';
 }
 
@@ -107,7 +155,7 @@ export class ConnectionService {
         shell: false as const,
         env: {
           ...process.env,
-          PATH: `${dirname(config.nodePath)}:${process.env.PATH || ''}`,
+          PATH: `${dirname(config.nodePath)}${delimiter}${process.env.PATH || ''}`,
           ULTRACART_PROFILE: '',
           NO_COLOR: '1',
         },

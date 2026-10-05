@@ -1,8 +1,14 @@
 import { z } from 'zod';
+import { version } from '../../package.json';
 import { Store } from './database';
 import { StudioServices } from './services';
 import { Auth, LocalCredentials } from './auth';
 import { Agents } from './agent';
+import { PageBuilderService } from './page-builder';
+import { LandingService } from './landing';
+import { WarehouseService } from './warehouse';
+import { ToolkitSkillsService } from './toolkit-skills';
+import { draftScopeSchema } from '../shared/drafts';
 import type { StudioEvent } from '../shared/types';
 
 const port = (process as any).parentPort;
@@ -10,6 +16,10 @@ if (!port) throw new Error('Studio worker requires a parent process.');
 let services: StudioServices;
 let agents: Agents;
 let auth: Auth;
+let builder: PageBuilderService;
+let landing: LandingService;
+let warehouse: WarehouseService;
+let toolkitSkills: ToolkitSkillsService;
 let sequence = 0;
 const pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
 const emit = (event: StudioEvent) => port.postMessage({ event });
@@ -20,7 +30,11 @@ function host(method: string, params: unknown): Promise<any> {
     port.postMessage({ host: true, id, method, params });
   });
 }
-const pathSchema = z.object({ path: z.string().min(1).max(2048) });
+const pathSchema = z.object({ path: z.string().min(1).max(2048), slot: draftScopeSchema.shape.slot });
+const inputScope = (input: unknown) => {
+  const v = pathSchema.parse(input);
+  return services.scope(v.path, v.slot);
+};
 const draftSchema = pathSchema.extend({ id: z.string().uuid(), revision: z.number().int().positive() });
 const sessionSchema = z.object({ id: z.string().uuid() });
 function sessionId(input: unknown) {
@@ -34,6 +48,10 @@ async function dispatch(method: string, input: any) {
     case 'init': {
       const store = new Store(input.directory);
       services = new StudioServices(store, () => emit({ type: 'changed' }), input.root);
+      builder = new PageBuilderService(services);
+      landing = new LandingService(services);
+      warehouse = new WarehouseService(services);
+      toolkitSkills = new ToolkitSkillsService(services);
       auth = new Auth(
         new LocalCredentials(input.credentials, (values) => host('credentials.save', values)),
         store,
@@ -43,7 +61,11 @@ async function dispatch(method: string, input: any) {
         },
         (url) => host('auth.open', { url })
       );
-      agents = new Agents(services, auth, (id, view) => emit({ type: 'conversation', id, view }));
+      agents = new Agents(services, auth, (id, view) => emit({ type: 'conversation', id, view }), {
+        builder,
+        landing,
+        warehouse,
+      });
       void agents.recover();
       return { ready: true };
     }
@@ -56,7 +78,7 @@ async function dispatch(method: string, input: any) {
         changes: services.changes(),
         activity: services.store.activity(services.workspace().id),
         auth: await auth.status(),
-        version: '0.1.0',
+        version,
       };
     case 'settings.save': {
       if ((await auth.status()).phase === 'waiting' && input.provider !== auth.provider())
@@ -82,60 +104,135 @@ async function dispatch(method: string, input: any) {
     case 'connection.cancel':
       return services.connection.cancel(z.object({ id: z.string() }).parse(input).id);
     case 'page.inspect':
-      return services.detail(services.scope(pathSchema.parse(input).path));
+      return services.detail(inputScope(input));
+    case 'page.contentMap':
+      return services.contentMap(inputScope(input));
+    case 'draft.nativeIdsPlan': {
+      const v = draftSchema.parse(input);
+      return services.nativeIdsPlan(services.scope(v.path, v.slot), v.id, v.revision);
+    }
+    case 'draft.reserveNativeIds': {
+      const v = draftSchema.extend({ confirmedHost: z.string().max(253) }).parse(input);
+      return services.reserveNativeIds(services.scope(v.path, v.slot), v.id, v.revision, v.confirmedHost);
+    }
+    case 'builder.inspect':
+      return builder.inspect(inputScope(input));
+    case 'builder.apply': {
+      const scope = inputScope(input);
+      const { id, revision, operation } = input;
+      return builder.apply({ ...scope, id, revision, operation });
+    }
+    case 'landing.preparation':
+      return landing.preparation(input);
+    case 'landing.prepare':
+      return landing.prepare(input);
+    case 'landing.reserveNativeIds':
+      return landing.reserveNativeIds(input);
+    case 'landing.prepareExport':
+      return landing.prepareExport(input);
+    case 'landing.list':
+      return landing.list();
+    case 'landing.read':
+      return landing.read(sessionSchema.parse(input).id);
+    case 'landing.readiness':
+      return landing.readiness(sessionSchema.parse(input).id);
+    case 'landing.create':
+      return landing.create(input);
+    case 'landing.update':
+      return landing.update(input);
+    case 'landing.patchFields':
+      return landing.patchFields(input);
+    case 'landing.operate':
+      return landing.operate(input);
+    case 'landing.history':
+      return landing.history(sessionSchema.parse(input).id);
+    case 'landing.restore':
+      return landing.restore(input);
+    case 'landing.archive':
+      return landing.archive(input);
+    case 'landing.export':
+      return landing.export(input);
+    case 'warehouse.diagnose':
+      return warehouse.diagnose(input);
+    case 'toolkit.skills.list':
+      return toolkitSkills.list(input);
+    case 'toolkit.skills.read':
+      return toolkitSkills.read(input);
+    case 'warehouse.status':
+      return warehouse.status(input);
+    case 'warehouse.configure':
+      return warehouse.configure(input);
+    case 'warehouse.tables':
+      return warehouse.tables(input);
+    case 'warehouse.schema':
+      return warehouse.schema(input);
+    case 'warehouse.prepare':
+      return warehouse.prepare(input);
+    case 'warehouse.run':
+      return warehouse.run(input);
+    case 'warehouse.history':
+      return warehouse.history(input);
+    case 'warehouse.save':
+      return warehouse.save(input);
     case 'page.templates':
-      return services.templates(services.scope(pathSchema.parse(input).path));
+      return services.templates(inputScope(input));
     case 'page.source': {
       const v = pathSchema.extend({ kind: z.enum(['group', 'item']).default('group') }).parse(input);
-      return services.templateSource(services.scope(v.path), v.kind);
+      return services.templateSource(services.scope(v.path, v.slot), v.kind);
     }
     case 'draft.read':
-      return services.drafts.read(services.scope(pathSchema.parse(input).path));
+      return services.drafts.read(inputScope(input));
     case 'draft.pull':
-      return services.pull(services.scope(pathSchema.parse(input).path));
+      return services.pull(inputScope(input));
     case 'draft.save': {
       const v = draftSchema
         .extend({
           edits: z.array(z.object({ pointer: z.string().max(4096), value: z.string().max(16384) })).max(100),
         })
         .parse(input);
-      return services.save({ ...services.scope(v.path), id: v.id, revision: v.revision, edits: v.edits });
+      return services.save({
+        ...services.scope(v.path, v.slot),
+        id: v.id,
+        revision: v.revision,
+        edits: v.edits,
+      });
     }
     case 'draft.review': {
       const v = draftSchema.parse(input);
-      return services.review(services.scope(v.path), v.id, v.revision);
+      return services.review(services.scope(v.path, v.slot), v.id, v.revision);
     }
     case 'draft.history': {
       const v = pathSchema.extend({ id: z.string().uuid() }).parse(input);
-      if (services.drafts.read(services.scope(v.path))?.id !== v.id) throw new Error('Draft scope mismatch.');
+      if (services.drafts.read(services.scope(v.path, v.slot))?.id !== v.id)
+        throw new Error('Draft scope mismatch.');
       return services.history(v.id);
     }
     case 'draft.restore': {
       const v = draftSchema.parse(input);
-      return services.restore(services.scope(v.path), v.id, v.revision);
+      return services.restore(services.scope(v.path, v.slot), v.id, v.revision);
     }
     case 'draft.export': {
       const v = draftSchema.parse(input);
-      return services.exportDraft(services.scope(v.path), v.id, v.revision);
+      return services.exportDraft(services.scope(v.path, v.slot), v.id, v.revision);
     }
     case 'draft.publish': {
       const v = draftSchema.extend({ confirmation: z.string() }).parse(input);
-      return services.publish(services.scope(v.path), v.id, v.revision, v.confirmation);
+      return services.publish(services.scope(v.path, v.slot), v.id, v.revision, v.confirmation);
     }
     case 'draft.verify': {
       const v = draftSchema.parse(input);
-      return services.verifyPublish(services.scope(v.path), v.id, v.revision);
+      return services.verifyPublish(services.scope(v.path, v.slot), v.id, v.revision);
     }
     case 'draft.next': {
       const v = draftSchema.parse(input);
-      return services.nextDraft(services.scope(v.path), v.id, v.revision);
+      return services.nextDraft(services.scope(v.path, v.slot), v.id, v.revision);
     }
     case 'preview.prepare': {
       if (input.kind === 'draft') {
         const v = draftSchema.parse(input);
-        return services.stage(services.scope(v.path), v.id, v.revision);
+        return services.stage(services.scope(v.path, v.slot), v.id, v.revision);
       }
-      const scope = services.scope(pathSchema.parse(input).path);
+      const scope = inputScope(input);
       const { storefrontUrl } = await import('../shared/storefront');
       return {
         url: storefrontUrl(scope.selection.storefront.host, scope.path),
@@ -149,8 +246,18 @@ async function dispatch(method: string, input: any) {
       services.markPreview(v.id, v.revision);
       return true;
     }
-    case 'session.create':
-      return agents.create(pathSchema.parse(input).path);
+    case 'session.create': {
+      const target = z
+        .union([
+          pathSchema.strict(),
+          z.object({ landingId: z.string().uuid() }).strict(),
+          z.object({ warehouse: z.literal(true) }).strict(),
+        ])
+        .parse(input);
+      if ('landingId' in target) return agents.createLanding(target.landingId);
+      if ('warehouse' in target) return agents.createWarehouse();
+      return agents.create(target.path, 'Untitled change', target.slot);
+    }
     case 'session.view':
       return agents.view(sessionId(input));
     case 'session.send': {
@@ -181,6 +288,7 @@ async function dispatch(method: string, input: any) {
     case 'shutdown':
       auth.cancel();
       await agents.close();
+      warehouse.dispose();
       services.connection.dispose();
       services.store.close();
       return true;

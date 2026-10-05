@@ -7,7 +7,10 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { ConnectionService } from './domain/connection-service';
 import { DraftService, draftHash, containerPath } from './domain/draft-service';
-import { draftSaveSchema } from '../shared/drafts';
+import { draftSaveSchema, draftScopeSchema } from '../shared/drafts';
+import { readContentMap } from './content-map';
+import { WidgetIdsService } from './widget-ids';
+import { builderApplySchema, inspectBuilderContent } from '../shared/page-builder';
 import { assertPagePath, sameStore, storefrontUrl } from '../shared/storefront';
 import { Store } from './database';
 import { isSampleSelection } from '../shared/sample';
@@ -66,6 +69,7 @@ export class StudioServices {
   readonly connection: ConnectionService;
   readonly drafts: DraftService;
   readonly sampleDrafts: DraftService;
+  readonly widgetIds: WidgetIdsService;
   private publishBusy = new Set<string>();
   constructor(
     readonly store: Store,
@@ -119,6 +123,7 @@ export class StudioServices {
     this.connection = new ConnectionService(async () => this.settings());
     this.drafts = new DraftService(store.db, this.connection);
     this.sampleDrafts = new DraftService(store.db, sampleToolkit);
+    this.widgetIds = new WidgetIdsService(this);
   }
   private draftService(scope: DraftScope) {
     return isSampleSelection(scope.selection) ? this.sampleDrafts : this.drafts;
@@ -195,11 +200,11 @@ export class StudioServices {
     this.emit();
     return sampleWorkspace;
   }
-  scope(path: string): DraftScope {
+  scope(path: string, slot = 'body'): DraftScope {
     assertPagePath(path);
     const workspace = this.workspace();
     if (!this.pages().some((p) => p.path === path)) throw new Error('Select a page in this storefront.');
-    return { selection: workspace.selection, path, slot: 'body' };
+    return draftScopeSchema.parse({ selection: workspace.selection, path, slot });
   }
   private record(id: string): Record {
     for (const row of this.store.db.prepare('SELECT record FROM storefront_drafts').all()) {
@@ -264,13 +269,8 @@ export class StudioServices {
   }
   async save(input: unknown) {
     const v = draftSaveSchema.parse(input);
-    if (this.publishBusy.has(v.id))
-      throw new Error('Publishing is in progress. Wait for verification before editing.');
-    if (this.getChange(v.id).publishedAt)
-      throw new Error('This revision was published. Start a new draft to edit the latest live content.');
-    if (this.store.get(`publish-attempt:${v.id}`, null))
-      throw new Error('A publish attempt needs verification before further edits.');
-    const draft = this.remember(await this.draftService(v).update(v));
+    this.assertEditable(v.id);
+    const draft = this.remember(await this.draftService(v).update(v, () => this.assertEditable(v.id)));
     this.store.log(
       workspaceId(v.selection),
       'draft',
@@ -279,6 +279,74 @@ export class StudioServices {
     );
     this.emit();
     return draft;
+  }
+  private assertEditable(id: string) {
+    if (this.publishBusy.has(id))
+      throw new Error('Publishing is in progress. Wait for verification before editing.');
+    if (this.getChange(id).publishedAt)
+      throw new Error('This revision was published. Start a new draft to edit the latest live content.');
+    if (this.store.get(`publish-attempt:${id}`, null))
+      throw new Error('A publish attempt needs verification before further edits.');
+  }
+  async saveStructure(input: unknown) {
+    const v = builderApplySchema.parse(input);
+    this.assertEditable(v.id);
+    const draft = this.remember(
+      await this.draftService(v).updateStructure(v, () => this.assertEditable(v.id))
+    );
+    this.store.log(
+      workspaceId(v.selection),
+      'draft',
+      'Page structure saved',
+      `${v.path} · revision ${draft.revision}`
+    );
+    this.emit();
+    return draft;
+  }
+  contentMap(scope: DraftScope) {
+    return readContentMap(this.connection, scope);
+  }
+  nativeIdsPlan(scope: DraftScope, id: string, revision: number) {
+    const record = this.checkRecord(scope, id, revision);
+    return this.widgetIds.inspect({
+      selection: scope.selection,
+      content: record.content,
+      operationKey: `draft:${id}:revision:${revision}`,
+    });
+  }
+  async reserveNativeIds(scope: DraftScope, id: string, revision: number, confirmedHost: string) {
+    this.assertEditable(id);
+    const record = this.checkRecord(scope, id, revision);
+    const assertCurrent = () => {
+      if (!sameStore(this.workspace().selection, scope.selection))
+        throw new Error(
+          'The active storefront changed. Reserved IDs remain in the preparation receipt. Return to the original draft.'
+        );
+      this.assertEditable(id);
+      this.checkRecord(scope, id, revision);
+    };
+    assertCurrent();
+    const prepared = await new WidgetIdsService(this, { assertCurrent }).reserve({
+      selection: scope.selection,
+      content: record.content,
+      operationKey: `draft:${id}:revision:${revision}`,
+      confirmedHost,
+    });
+    assertCurrent();
+    const draft = this.remember(
+      await this.draftService(scope).updateContent(
+        { ...scope, id, revision, content: prepared.content },
+        assertCurrent
+      )
+    );
+    this.store.log(
+      workspaceId(scope.selection),
+      'draft',
+      'Native widget IDs reserved',
+      `${scope.path} · ${scope.slot} · revision ${draft.revision}`
+    );
+    this.emit();
+    return { draft, receipt: prepared.receipt };
   }
   async review(scope: DraftScope, id: string, revision: number) {
     const review = await this.draftService(scope).review({ ...scope, id, revision });
@@ -302,13 +370,31 @@ export class StudioServices {
       });
   }
   async restore(scope: DraftScope, id: string, revision: number) {
-    const current = this.drafts.read(scope);
+    const current = this.draftService(scope).read(scope);
     if (current?.id !== id) throw new Error('Draft scope mismatch.');
     const row = this.store.db
       .prepare('SELECT value FROM revisions WHERE draft_id = ? AND revision = ?')
       .get(id, revision);
     if (!row) throw new Error('Revision not found.');
-    const prior = JSON.parse(row.value as string).draft as Draft;
+    const snapshot = JSON.parse(row.value as string) as { draft: Draft; record?: Record };
+    if (typeof snapshot.record?.content === 'string') {
+      this.assertEditable(id);
+      const draft = this.remember(
+        await this.draftService(scope).updateContent(
+          { ...scope, id, revision: current.revision, content: snapshot.record.content },
+          () => this.assertEditable(id)
+        )
+      );
+      this.store.log(
+        workspaceId(scope.selection),
+        'draft',
+        'Draft revision restored',
+        `${scope.path} · revision ${draft.revision}`
+      );
+      this.emit();
+      return draft;
+    }
+    const prior = snapshot.draft;
     return this.save({
       ...scope,
       id,
@@ -408,6 +494,8 @@ export class StudioServices {
     const record = this.checkRecord(scope, id, revision);
     if (isSampleSelection(scope.selection))
       throw new Error('Sample drafts render locally. Select Draft in the canvas.');
+    if (inspectBuilderContent(record.content).localNodeIds.length)
+      throw new Error('New widgets still have local IDs. Reserve UltraCart IDs before remote preview.');
     const review = await this.review(scope, id, revision);
     if (!review.validation.valid || review.remoteChanged)
       throw new Error('Resolve validation errors or remote changes before previewing.');
@@ -495,6 +583,8 @@ export class StudioServices {
     this.publishBusy.add(id);
     try {
       const record = this.checkRecord(scope, id, revision);
+      if (inspectBuilderContent(record.content).localNodeIds.length)
+        throw new Error('New widgets still have local IDs. Reserve UltraCart IDs before publishing.');
       if (this.getChange(id).previewedRevision !== revision)
         throw new Error('Open and verify the UltraCart preview of this exact revision first.');
       const review = await this.review(scope, id, revision);

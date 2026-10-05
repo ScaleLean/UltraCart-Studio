@@ -4,6 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Selection } from '../../shared/connection';
 import { assertPagePath } from '../../shared/storefront';
+import { isSampleSelection } from '../../shared/sample';
+import {
+  applyBuilderOperation,
+  builderApplySchema,
+  draftContentSaveSchema,
+  inspectBuilderContent,
+  parsePageDocument,
+} from '../../shared/page-builder';
 import {
   draftScopeSchema,
   draftSaveSchema,
@@ -155,15 +163,24 @@ export function editDraftContent(content: string, edits: { pointer: string; valu
   return text;
 }
 export function draftChanges(baseline: string, content: string) {
-  const before = new Map(fields(baseline).fields.map((f) => [f.pointer, f.value]));
+  const before = new Map(fields(baseline).fields.map((f) => [`${f.widget}\u0000${f.key}`, f.value]));
   return fields(content)
-    .fields.map((f) => ({ ...f, before: before.get(f.pointer) ?? '' }))
+    .fields.map((f) => ({ ...f, before: before.get(`${f.widget}\u0000${f.key}`) ?? '' }))
     .filter((f) => f.before !== f.value);
 }
 function view(record: Stored): Draft {
-  const original = new Map(fields(record.baseline).fields.map((f) => [f.pointer, f.value]));
+  const original = new Map(fields(record.baseline).fields.map((f) => [`${f.widget}\u0000${f.key}`, f.value]));
   const current = fields(record.content);
-  const output = current.fields.map((f) => ({ ...f, before: original.get(f.pointer) ?? '' }));
+  const output = current.fields.map((f) => ({
+    ...f,
+    before: original.get(`${f.widget}\u0000${f.key}`) ?? '',
+  }));
+  let structure: ReturnType<typeof inspectBuilderContent> | null = null;
+  try {
+    structure = inspectBuilderContent(record.content, record.baseline);
+  } catch {
+    /* Older text-only drafts remain readable when structural editing is unavailable. */
+  }
   return {
     id: record.id,
     path: record.scope.path,
@@ -175,7 +192,11 @@ function view(record: Stored): Draft {
     updatedAt: record.updatedAt,
     fields: output,
     skippedFields: current.skipped,
-    changedFields: output.filter((f) => f.before !== f.value).length,
+    changedFields:
+      output.filter((f) => f.before !== f.value).length + (structure?.structureChanges.length ?? 0),
+    changedTextFields: output.filter((f) => f.before !== f.value).length,
+    structureChanges: structure?.structureChanges ?? [],
+    localWidgetCount: structure?.localNodeIds.length ?? 0,
   };
 }
 export function parseDraftValidation(text: string): DraftReview['validation'] {
@@ -312,6 +333,12 @@ export class DraftService {
     const record = this.load(scope);
     return record ? view(record) : null;
   }
+  readDocument(raw: DraftScope) {
+    const scope = draftScopeSchema.parse(raw);
+    containerPath(scope.path, scope.slot);
+    const record = this.load(scope);
+    return record ? { draft: view(record), content: record.content, baseline: record.baseline } : null;
+  }
   pull(raw: DraftScope): Promise<Draft> {
     const scope = draftScopeSchema.parse(raw);
     containerPath(scope.path, scope.slot);
@@ -336,9 +363,10 @@ export class DraftService {
       return view(record);
     });
   }
-  update(raw: unknown): Promise<Draft> {
+  update(raw: unknown, assertEditable?: () => void): Promise<Draft> {
     const input = draftSaveSchema.parse(raw);
     return this.serialized(async () => {
+      assertEditable?.();
       const record = this.load(input);
       if (!record || record.id !== input.id)
         throw new Error('This draft does not belong to this page and store.');
@@ -347,6 +375,47 @@ export class DraftService {
       const content = editDraftContent(record.content, input.edits);
       if (draftChanges(record.content, content).length) {
         record.content = content;
+        record.revision++;
+        record.updatedAt = new Date().toISOString();
+        this.save(record);
+      }
+      return view(record);
+    });
+  }
+  updateStructure(raw: unknown, assertEditable?: () => void): Promise<Draft> {
+    const input = builderApplySchema.parse(raw);
+    return this.serialized(async () => {
+      assertEditable?.();
+      const record = this.load(input);
+      if (!record || record.id !== input.id)
+        throw new Error('This draft does not belong to this page and store.');
+      if (record.revision !== input.revision)
+        throw new Error('This draft changed in another window. Reload it before saving.');
+      const content = applyBuilderOperation(record.content, input.operation);
+      if (content !== record.content) {
+        record.content = content;
+        record.revision++;
+        record.updatedAt = new Date().toISOString();
+        this.save(record);
+      }
+      return view(record);
+    });
+  }
+  updateContent(raw: unknown, assertEditable?: () => void): Promise<Draft> {
+    const input = draftContentSaveSchema.parse(raw);
+    return this.serialized(async () => {
+      assertEditable?.();
+      const record = this.load(input);
+      if (!record || record.id !== input.id)
+        throw new Error('This draft does not belong to this page and store.');
+      if (record.revision !== input.revision)
+        throw new Error('This draft changed in another window. Reload it before saving.');
+      const before = parsePageDocument(record.content);
+      const after = parsePageDocument(input.content);
+      if (before.id !== after.id || before.type !== after.type)
+        throw new Error('Restoring content cannot replace the page body identity.');
+      if (input.content !== record.content) {
+        record.content = input.content;
         record.revision++;
         record.updatedAt = new Date().toISOString();
         this.save(record);
@@ -366,6 +435,17 @@ export class DraftService {
         await writeFile(file, record.content, { mode: 0o600, flag: 'wx' });
         return parseDraftValidation(await this.toolkit.validateLocal(file));
       });
+      const localWidgetCount = view(record).localWidgetCount ?? 0;
+      if (localWidgetCount && !isSampleSelection(scope.selection)) {
+        validation.valid = false;
+        validation.errors++;
+        validation.diagnostics.push({
+          severity: 'error',
+          code: 'STUDIO_LOCAL_WIDGET_IDS',
+          path: '/',
+          message: `${localWidgetCount} new widgets still have local IDs. Reserve UltraCart IDs before remote preview or publishing.`,
+        });
+      }
       const remote = await this.remote(scope);
       return {
         draft: view(record),

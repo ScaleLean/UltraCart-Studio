@@ -16,6 +16,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { StudioEvent } from '../shared/types';
+import { assertSecureCredentialStorage } from './secure-storage';
 
 app.setName('UltraCart Studio');
 if (process.env.UC_STUDIO_DATA) {
@@ -42,14 +43,23 @@ const send = (event: StudioEvent) => {
   if (win && !win.isDestroyed()) win.webContents.send('studio:event', event);
 };
 
+let credentialLoadError: string | null = null;
 function loadCredentials() {
   const file = join(directory, 'credentials.enc');
   if (!existsSync(file)) return {};
-  if (!safeStorage.isEncryptionAvailable()) throw new Error('macOS credential encryption is unavailable.');
-  return JSON.parse(safeStorage.decryptString(readFileSync(file)));
+  try {
+    assertSecureCredentialStorage(safeStorage);
+    return JSON.parse(safeStorage.decryptString(readFileSync(file)));
+  } catch (error) {
+    credentialLoadError =
+      process.platform === 'linux'
+        ? 'Saved agent credentials could not be unlocked. Start and unlock GNOME Keyring or KWallet, then restart Studio. Your local projects remain available.'
+        : 'Saved agent credentials could not be unlocked. Unlock your operating system credential store, then restart Studio. Your local projects remain available.';
+    return {};
+  }
 }
 function saveCredentials(value: unknown) {
-  if (!safeStorage.isEncryptionAvailable()) throw new Error('Credential encryption is unavailable.');
+  assertSecureCredentialStorage(safeStorage);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = join(directory, 'credentials.enc');
   writeFileSync(file + '.tmp', safeStorage.encryptString(JSON.stringify(value)), { mode: 0o600 });
@@ -145,9 +155,38 @@ const publicMethods = new Set([
   'connection.begin',
   'connection.poll',
   'connection.cancel',
+  'toolkit.skills.list',
+  'toolkit.skills.read',
   'page.inspect',
   'page.templates',
   'page.source',
+  'page.contentMap',
+  'draft.nativeIdsPlan',
+  'draft.reserveNativeIds',
+  'builder.inspect',
+  'builder.apply',
+  'landing.list',
+  'landing.read',
+  'landing.readiness',
+  'landing.preparation',
+  'landing.prepare',
+  'landing.reserveNativeIds',
+  'landing.create',
+  'landing.update',
+  'landing.patchFields',
+  'landing.operate',
+  'landing.history',
+  'landing.restore',
+  'landing.archive',
+  'warehouse.status',
+  'warehouse.diagnose',
+  'warehouse.configure',
+  'warehouse.tables',
+  'warehouse.schema',
+  'warehouse.prepare',
+  'warehouse.run',
+  'warehouse.history',
+  'warehouse.save',
   'draft.read',
   'draft.pull',
   'draft.save',
@@ -260,6 +299,17 @@ async function openPreview(params: any) {
 ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) => {
   trusted(event);
   await ready;
+  if (method === 'auth.begin') {
+    assertSecureCredentialStorage(safeStorage);
+    if (credentialLoadError) throw new Error(credentialLoadError);
+  }
+  if (method === 'bootstrap' && credentialLoadError) {
+    const result = await call(method, params);
+    return {
+      ...result,
+      auth: { ...result.auth, connected: false, phase: 'error', message: credentialLoadError },
+    };
+  }
   if (publicMethods.has(method)) return call(method, params);
   if (method === 'preview.open') return openPreview(params);
   if (method === 'preview.close') {
@@ -282,6 +332,27 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
     await shell.openExternal(url.href);
     return true;
   }
+  if (method === 'window.openWarehouseHelp') {
+    const url = new URL(
+      z
+        .object({ url: z.string().max(512) })
+        .strict()
+        .parse(params).url
+    );
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== 'docs.cloud.google.com' ||
+      url.port ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !/^\/(?:sdk|bigquery)\//.test(url.pathname)
+    )
+      throw new Error('Unexpected warehouse documentation URL.');
+    await shell.openExternal(url.href);
+    return true;
+  }
   if (method === 'draft.export') {
     const text = await call(method, params);
     const result = await dialog.showSaveDialog(win, {
@@ -290,6 +361,16 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
       filters: [{ name: 'UltraCart container', extensions: ['cjson'] }],
     });
     if (!result.canceled && result.filePath) writeFileSync(result.filePath, text, { mode: 0o600 });
+    return { saved: !result.canceled };
+  }
+  if (method === 'landing.export' || method === 'landing.prepareExport') {
+    const output = await call(method, params);
+    const result = await dialog.showSaveDialog(win, {
+      title: 'Export landing page draft',
+      defaultPath: output.filename,
+      filters: [{ name: 'Studio landing draft', extensions: ['json'] }],
+    });
+    if (!result.canceled && result.filePath) writeFileSync(result.filePath, output.content, { mode: 0o600 });
     return { saved: !result.canceled };
   }
   if (method === 'app.restartEngine') {
