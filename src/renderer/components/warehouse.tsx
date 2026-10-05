@@ -907,12 +907,12 @@ export function Warehouse({
               variant="outline"
               onClick={() =>
                 onAgent(
-                  `Help me answer a question about the selected merchant warehouse. Inspect the available schema first. Draft and save a read-only SQL query for me to review. Do not run a query. Current SQL: ${sql}`
+                  `Help me answer a question about the selected merchant warehouse. Inspect the available schema first. Draft and save a read-only SQL query for me to review. Read the latest completed query result if available and explain its limits. Do not run a query. Current SQL: ${sql}`
                 )
               }
               disabled={!!busy}
             >
-              <Code2 size={14} /> Ask about data
+              <Code2 size={14} /> Ask in chat
             </Button>
           )}
           <Button variant="outline" onClick={() => setShowSettings(true)} disabled={!status || !!busy}>

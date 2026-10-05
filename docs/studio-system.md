@@ -154,6 +154,8 @@ Electron’s main process owns trusted application operations. An isolated utili
 
 Pi Durable runs conversations with explicit tools. Page, landing, and warehouse conversations have different targets and tool sets. A page conversation pins merchant, storefront, page path, and slot; it cannot silently switch into a different page session.
 
+Warehouse chat stays beside the SQL editor. It can inspect schemas, save SQL, and read the latest completed query result cached for the selected merchant. The cache persists locally until the next successful query replaces it. Result pages include SQL, execution time, local result ID, scan estimate, loaded row count, and row limits. The agent receives at most 20 rows and 24 KiB of row data per call; omitted rows are reported. Cached rows can be sent to the connected model provider during chat. Chat cannot execute a query or dry run. Review saved SQL, use Dry run, then Run before asking the agent to explain the results.
+
 Tool responses and model messages appear in the conversation. The agent can investigate, draft, and save local edits, but Studio keeps publication, native ID allocation, and warehouse execution behind user controls.
 
 ### Storage and recovery

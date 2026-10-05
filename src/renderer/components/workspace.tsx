@@ -936,6 +936,10 @@ export function AgentPanel({
           'Read the warehouse status and table metadata. Explain what questions the available data can answer. Do not run a query.',
         ],
         [
+          'Explain my latest results',
+          'Read my latest completed query result. Explain the main findings, cite its local result ID and execution time, and state the date range and row limits. Distinguish observations from possible causes. If no results exist, help me prepare SQL to review and run.',
+        ],
+        [
           'Draft a revenue query',
           'Inspect actual table schemas and save a query that summarizes recent revenue by day. Use verified fields and an explicit date range. Do not run it.',
         ],
@@ -1048,12 +1052,18 @@ export function AgentPanel({
               <Sparkles />
             </div>
             <h2>
-              A little direction.
-              <br />A lot of possibility.
+              {warehouse ? (
+                'What would you like to know?'
+              ) : (
+                <>
+                  A little direction.
+                  <br />A lot of possibility.
+                </>
+              )}
             </h2>
             <p>
               {warehouse
-                ? 'Explore your schemas and prepare SQL you can inspect, estimate, and run.'
+                ? 'Ask a question, inspect the evidence, and discuss your completed query results. I can prepare SQL for you to review and run.'
                 : landing
                   ? 'Turn your brief into clear sections and copy, saved in your local landing draft.'
                   : 'I can explore this page, refine its content, and prepare a change for you to review.'}
@@ -1095,7 +1105,11 @@ export function AgentPanel({
           <Textarea
             aria-label="Message your agent"
             placeholder={
-              view.busy ? 'Add a follow-up or steer the agent...' : 'Describe what you want to change...'
+              view.busy
+                ? 'Add a follow-up or steer the agent...'
+                : warehouse
+                  ? 'Ask a question about your data...'
+                  : 'Describe what you want to change...'
             }
             value={text}
             onChange={(event) => setText(event.target.value)}
