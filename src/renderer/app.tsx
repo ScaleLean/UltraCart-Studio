@@ -97,6 +97,7 @@ export function App() {
   const [commandSearch, setCommandSearch] = useState('');
   const [engine, setEngine] = useState('ready');
   const [sidebar, setSidebar] = useState(true);
+  const [focusPageSearch, setFocusPageSearch] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [initialPrompt, setInitialPrompt] = useState('');
   const [selectedLandingId, setSelectedLandingId] = useState<string>();
@@ -156,13 +157,22 @@ export function App() {
       }
       if (
         event.key === '/' &&
+        !event.defaultPrevented &&
+        !event.isComposing &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !document.querySelector('[role=dialog][data-state=open], [role=alertdialog][data-state=open]') &&
         !(
           event.target instanceof HTMLElement &&
           event.target.closest('input, textarea, select, [contenteditable=true]')
         )
       ) {
         event.preventDefault();
-        document.getElementById('page-search')?.focus();
+        setScreen('canvas');
+        setSidebar(true);
+        setFeatureAgent(null);
+        setFocusPageSearch(true);
       }
       if ((event.metaKey || event.ctrlKey) && event.key === ',') {
         event.preventDefault();
@@ -172,6 +182,12 @@ export function App() {
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, []);
+  useEffect(() => {
+    if (focusPageSearch && screen === 'canvas' && sidebar) {
+      document.getElementById('page-search')?.focus();
+      setFocusPageSearch(false);
+    }
+  }, [focusPageSearch, screen, sidebar]);
   useEffect(() => {
     document.documentElement.dataset.theme = data?.settings.theme || 'light';
   }, [data?.settings.theme]);
@@ -324,7 +340,7 @@ export function App() {
           <kbd>{commandKey} K</kbd>
         </button>
       </header>
-      <aside className="sidebar">
+      <aside className={cn('sidebar', screen === 'canvas' && 'sidebar-pages')}>
         <button className="workspace-switch" onClick={() => setConnect(true)}>
           <span className="workspace-avatar">{isSample ? 'f' : data.workspace.label[0].toUpperCase()}</span>
           <span>
@@ -337,8 +353,12 @@ export function App() {
           <button className={screen === 'home' ? 'active' : ''} onClick={() => goTo('home')}>
             <Home /> Overview
           </button>
-          <button className={screen === 'canvas' ? 'active' : ''} onClick={() => goTo('canvas')}>
-            <LayoutGrid /> Storefront <span>{data.pages.length}</span>
+          <button
+            className={screen === 'canvas' ? 'active' : ''}
+            aria-current={screen === 'canvas' ? 'page' : undefined}
+            onClick={() => goTo('canvas')}
+          >
+            <LayoutGrid /> Pages <span>{data.pages.length}</span>
           </button>
           <button
             className={screen === 'landing' ? 'active' : ''}
@@ -369,68 +389,72 @@ export function App() {
             <BookOpen /> Toolkit reference
           </button>
         </nav>
-        <div className="sidebar-section-title">
-          <span>PAGES</span>
-          <IconButton label="Refresh storefront" onClick={refreshCatalog} disabled={refreshing}>
-            {refreshing ? <LoaderCircle className="spin" /> : <RefreshCw />}
-          </IconButton>
-        </div>
-        <div className="page-filter">
-          <Search size={13} />
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Find a page..."
-            aria-label="Find a page"
-            id="page-search"
-          />
-          <kbd>/</kbd>
-        </div>
-        <div className="page-tree" role="navigation" aria-label="Storefront pages">
-          {rows.slice(0, 120).map(({ page: p, depth, hasChildren }) => (
-            <div
-              key={p.path}
-              className={cn('page-tree-item', page === p.path && screen === 'canvas' && 'selected')}
-              style={{ paddingLeft: `${8 + depth * 12}px` }}
-            >
-              {hasChildren && !search ? (
-                <button
-                  className="tree-toggle"
-                  aria-label={`${expanded.has(p.path) ? 'Collapse' : 'Expand'} ${p.title}`}
-                  aria-expanded={expanded.has(p.path)}
-                  onClick={() =>
-                    setExpanded((previous) => {
-                      const next = new Set(previous);
-                      if (next.has(p.path)) next.delete(p.path);
-                      else next.add(p.path);
-                      return next;
-                    })
-                  }
-                >
-                  <ChevronRight className={expanded.has(p.path) ? 'expanded' : ''} />
-                </button>
-              ) : (
-                <span className="tree-toggle-spacer" />
-              )}
-              <button className="page-row" onClick={() => openPage(p.path)} title={p.path}>
-                <span className="tree-icon">
-                  {p.path === '/' ? <Home /> : hasChildren ? <Folder /> : <FileText />}
-                </span>
-                <span className="page-tree-label">
-                  {p.title}
-                  {search && <small>{p.path}</small>}
-                </span>
-                {data.changes.some((c) => c.scope.path === p.path && c.draft.changedFields > 0) && (
-                  <i className="draft-dot" />
-                )}
-              </button>
+        {screen === 'canvas' && (
+          <>
+            <div className="sidebar-section-title">
+              <span>PAGES</span>
+              <IconButton label="Refresh storefront" onClick={refreshCatalog} disabled={refreshing}>
+                {refreshing ? <LoaderCircle className="spin" /> : <RefreshCw />}
+              </IconButton>
             </div>
-          ))}
-          {rows.length > 120 && (
-            <div className="tree-more">Showing 120 of {rows.length} results. Search to narrow.</div>
-          )}
-          {rows.length === 0 && <div className="tree-more">No matching pages</div>}
-        </div>
+            <div className="page-filter">
+              <Search size={13} />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Find a page..."
+                aria-label="Find a page"
+                id="page-search"
+              />
+              <kbd>/</kbd>
+            </div>
+            <div className="page-tree" role="navigation" aria-label="Storefront pages">
+              {rows.slice(0, 120).map(({ page: p, depth, hasChildren }) => (
+                <div
+                  key={p.path}
+                  className={cn('page-tree-item', page === p.path && screen === 'canvas' && 'selected')}
+                  style={{ paddingLeft: `${8 + depth * 12}px` }}
+                >
+                  {hasChildren && !search ? (
+                    <button
+                      className="tree-toggle"
+                      aria-label={`${expanded.has(p.path) ? 'Collapse' : 'Expand'} ${p.title}`}
+                      aria-expanded={expanded.has(p.path)}
+                      onClick={() =>
+                        setExpanded((previous) => {
+                          const next = new Set(previous);
+                          if (next.has(p.path)) next.delete(p.path);
+                          else next.add(p.path);
+                          return next;
+                        })
+                      }
+                    >
+                      <ChevronRight className={expanded.has(p.path) ? 'expanded' : ''} />
+                    </button>
+                  ) : (
+                    <span className="tree-toggle-spacer" />
+                  )}
+                  <button className="page-row" onClick={() => openPage(p.path)} title={p.path}>
+                    <span className="tree-icon">
+                      {p.path === '/' ? <Home /> : hasChildren ? <Folder /> : <FileText />}
+                    </span>
+                    <span className="page-tree-label">
+                      {p.title}
+                      {search && <small>{p.path}</small>}
+                    </span>
+                    {data.changes.some((c) => c.scope.path === p.path && c.draft.changedFields > 0) && (
+                      <i className="draft-dot" />
+                    )}
+                  </button>
+                </div>
+              ))}
+              {rows.length > 120 && (
+                <div className="tree-more">Showing 120 of {rows.length} results. Search to narrow.</div>
+              )}
+              {rows.length === 0 && <div className="tree-more">No matching pages</div>}
+            </div>
+          </>
+        )}
         {data.sessions.length > 0 && (
           <>
             <div className="sidebar-section-title">
@@ -561,7 +585,54 @@ export function App() {
           />
         )}
         {screen === 'warehouse' && (
-          <Warehouse key={data.workspace.id} boot={data} onAgent={openWarehouseAgent} onOpenPage={openPage} />
+          <div className="warehouse-chat-layout">
+            <Warehouse
+              key={data.workspace.id}
+              boot={data}
+              onAgent={openWarehouseAgent}
+              onOpenPage={openPage}
+            />
+            <aside className="warehouse-chat" aria-label="Chat with your data">
+              <header>
+                <div>
+                  <strong>Chat with your data</strong>
+                  <p>Selected merchant only</p>
+                </div>
+              </header>
+              <p className="warehouse-chat-disclosure">
+                Chat reads schemas and your latest completed query results through your connected AI provider.
+                Review SQL and scan estimates before you run it.
+              </p>
+              <AgentPanel
+                key={`${data.workspace.id}:${featureAgent && 'warehouse' in featureAgent.target ? featureAgent.instance : 0}`}
+                data={data}
+                page={featurePage('Data warehouse')}
+                target={{ warehouse: true }}
+                activeSession={
+                  featureAgent && 'warehouse' in featureAgent.target
+                    ? featureAgent.sessionId
+                    : data.sessions.find((item) => item.target?.kind === 'warehouse')?.id || null
+                }
+                setActiveSession={(id) =>
+                  setFeatureAgent((previous) => ({
+                    instance: previous && 'warehouse' in previous.target ? previous.instance : 0,
+                    target: { warehouse: true },
+                    page: featurePage('Data warehouse'),
+                    title: 'Data warehouse',
+                    sessionId: id,
+                    prompt: '',
+                  }))
+                }
+                initialPrompt={featureAgent && 'warehouse' in featureAgent.target ? featureAgent.prompt : ''}
+                clearInitialPrompt={() =>
+                  setFeatureAgent((previous) =>
+                    previous && 'warehouse' in previous.target ? { ...previous, prompt: '' } : previous
+                  )
+                }
+                openSettings={() => setSettings(true)}
+              />
+            </aside>
+          </div>
         )}
         {screen === 'toolkit' && <ToolkitReference boot={data} onSettings={() => setSettings(true)} />}
         {screen === 'changes' && <Changes changes={data.changes} openPage={openPage} />}
@@ -605,7 +676,7 @@ export function App() {
         )}
       </main>
       <Dialog
-        open={!!featureAgent}
+        open={!!featureAgent && 'landingId' in featureAgent.target}
         onOpenChange={(open) => {
           if (!open) setFeatureAgent(null);
         }}

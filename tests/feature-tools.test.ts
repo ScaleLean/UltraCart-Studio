@@ -246,6 +246,7 @@ test(
       );
       assert.deepEqual(names.sort(), [
         'warehouse_list_tables',
+        'warehouse_read_result',
         'warehouse_read_schema',
         'warehouse_save_query',
         'warehouse_status',
@@ -623,3 +624,28 @@ test(
     }
   }
 );
+
+test('warehouse chat reads completed evidence and rejects a switched merchant', async () => {
+  const f = await fixture();
+  try {
+    const session = await f.agents.createWarehouse();
+    const input = {
+      workspaceId: 'sample',
+      sql: 'SELECT channel, SUM(total) AS revenue FROM ultracart_dw.uc_orders GROUP BY channel',
+      rowLimit: 100,
+      maxBytes: 1024 ** 3,
+    };
+    // Select an exact supported sample query rather than sending SQL to a merchant.
+    const status = f.features.warehouse.status({ workspaceId: 'sample' });
+    const prepared = await f.features.warehouse.prepare({ ...input, sql: status.saved[0].sql });
+    await f.features.warehouse.run({ workspaceId: 'sample', ticket: prepared.ticket });
+    const evidence = await callFeature(f, session, 'warehouse_read_result', {});
+    assert.match(JSON.stringify(evidence), /totalLoadedRows/);
+    assert.equal(JSON.parse((evidence as { content: { text: string }[] }).content[0].text).sample, true);
+    f.store.set('workspace', otherWorkspace);
+    await assert.rejects(callFeature(f, session, 'warehouse_read_result', {}), /active storefront changed/);
+    assert.equal(f.remoteCalls(), 0);
+  } finally {
+    await f.cleanup();
+  }
+});

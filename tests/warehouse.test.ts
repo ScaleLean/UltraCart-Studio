@@ -587,3 +587,37 @@ test('sample diagnostics never start CLI processes and stale diagnostics cannot 
   await assert.rejects(f.warehouse.diagnose({ workspaceId: live.id }), /settings changed/);
   assert.equal(f.warehouse.status({ workspaceId: live.id }).diagnostics, null);
 });
+
+test('completed result evidence is scoped, paginated, and never triggers another query', async () => {
+  const f = fixture();
+  assert.equal(f.warehouse.readResult({ workspaceId: live.id }).available, false);
+  f.warehouse.configure({ workspaceId: live.id, bqPath: '/tools/bq', maxBytes: query.maxBytes });
+  f.setResponse(async (args) =>
+    args.includes('--dry_run')
+      ? dry()
+      : JSON.stringify(
+          Array.from({ length: 25 }, (_, i) => ({
+            orders: i,
+            note: i === 0 ? 'x'.repeat(25000) : 'ordinary data',
+          }))
+        )
+  );
+  const prepared = await f.warehouse.prepare({ workspaceId: live.id, ...query });
+  await f.warehouse.run({ workspaceId: live.id, ticket: prepared.ticket });
+  const calls = f.commands.length;
+  const result = f.warehouse.readResult({ workspaceId: live.id });
+  assert.equal(result.available, true);
+  if (!('rows' in result)) throw new Error('Expected cached rows');
+  assert.equal(result.sql, query.sql);
+  assert.equal(result.totalLoadedRows, 25);
+  assert.equal(result.rows.length, 19);
+  assert.deepEqual(result.omittedRowIndices, [0]);
+  assert.equal(result.nextOffset, 20);
+  const next = f.warehouse.readResult({ workspaceId: live.id, offset: 20 });
+  assert('rows' in next);
+  assert.equal(next.rows.length, 5);
+  assert.equal(f.commands.length, calls);
+  f.setWorkspace(sampleWorkspace);
+  assert.throws(() => f.warehouse.readResult({ workspaceId: live.id }), /workspace|storefront|merchant/i);
+  assert.equal(f.warehouse.readResult({ workspaceId: 'sample' }).available, false);
+});
