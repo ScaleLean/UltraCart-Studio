@@ -9,6 +9,7 @@ import { isSampleSelection } from '../shared/sample';
 import {
   WAREHOUSE_DEFAULT_BYTES,
   WAREHOUSE_MAX_BYTES,
+  WAREHOUSE_MIN_BYTES,
   warehouseDemoQueries,
   type WarehouseConfig,
   type WarehouseDiagnostics,
@@ -36,14 +37,19 @@ import {
 export type { WarehouseRunner } from './warehouse-diagnostics';
 
 const scopeInput = z.object({ workspaceId: z.string().min(1).max(100) });
+const byteCeiling = z
+  .number()
+  .int()
+  .min(WAREHOUSE_MIN_BYTES, 'BigQuery bills at least 10 MiB per query. Use a byte ceiling of 10 MiB or more.')
+  .max(WAREHOUSE_MAX_BYTES);
 const queryInput = z.object({
   sql: z.string().trim().min(1).max(20000),
   rowLimit: z.number().int().min(1).max(100),
-  maxBytes: z.number().int().min(1).max(WAREHOUSE_MAX_BYTES),
+  maxBytes: byteCeiling,
 });
 const tableName = z.string().regex(/^uc_[A-Za-z0-9_]{1,124}$/);
 const queryFunctions = new Set(
-  'ABS ACOS ANY_VALUE APPROX_COUNT_DISTINCT ARRAY ARRAY_AGG ARRAY_CONCAT ARRAY_LENGTH AVG CAST CEIL COALESCE CONCAT COUNT COUNTIF CURRENT_DATE CURRENT_DATETIME CURRENT_TIMESTAMP DATE DATE_ADD DATE_DIFF DATE_SUB DATE_TRUNC DATETIME DATETIME_DIFF DENSE_RANK ENDS_WITH EXTRACT FIRST_VALUE FLOOR FORMAT FORMAT_DATE FORMAT_TIMESTAMP GENERATE_ARRAY GENERATE_DATE_ARRAY GREATEST IF IFNULL JSON_EXTRACT JSON_EXTRACT_SCALAR JSON_QUERY JSON_VALUE LAG LAST_VALUE LEAD LEAST LENGTH LOWER MAX MIN MOD NULLIF OFFSET PARSE_DATE PARSE_TIMESTAMP PERCENTILE_CONT RANK REGEXP_CONTAINS REGEXP_EXTRACT REGEXP_REPLACE ROUND ROW_NUMBER SAFE_CAST SAFE_DIVIDE SAFE_MULTIPLY SAFE_OFFSET SAFE_SUBTRACT SPLIT SQRT STARTS_WITH STRING STRING_AGG STRUCT SUBSTR SUBSTRING SUM TIMESTAMP TIMESTAMP_ADD TIMESTAMP_DIFF TIMESTAMP_SECONDS TIMESTAMP_SUB TIMESTAMP_TRUNC TO_JSON_STRING TRIM UNNEST UPPER'.split(
+  'ABS ACOS ANY_VALUE APPROX_COUNT_DISTINCT ARRAY ARRAY_AGG ARRAY_CONCAT ARRAY_LENGTH AVG CAST CEIL COALESCE CONCAT COUNT COUNTIF CURRENT_DATE CURRENT_DATETIME CURRENT_TIMESTAMP DATE DATE_ADD DATE_DIFF DATE_SUB DATE_TRUNC DATETIME DATETIME_DIFF DENSE_RANK ENDS_WITH EXTRACT FIRST_VALUE FLOOR FORMAT FORMAT_DATE FORMAT_TIMESTAMP GENERATE_ARRAY GENERATE_DATE_ARRAY GREATEST IF IFNULL JSON_EXTRACT JSON_EXTRACT_SCALAR JSON_QUERY JSON_VALUE LAG LAST_VALUE LEAD LEAST LENGTH LOWER MAX MIN MOD NULLIF OFFSET PARSE_DATE PARSE_TIMESTAMP PERCENTILE_CONT RANK REGEXP_CONTAINS REGEXP_EXTRACT REGEXP_REPLACE REPLACE ROUND ROW_NUMBER SAFE_CAST SAFE_DIVIDE SAFE_MULTIPLY SAFE_OFFSET SAFE_SUBTRACT SPLIT SQRT STARTS_WITH STRING STRING_AGG STRUCT SUBSTR SUBSTRING SUM TIMESTAMP TIMESTAMP_ADD TIMESTAMP_DIFF TIMESTAMP_SECONDS TIMESTAMP_SUB TIMESTAMP_TRUNC TO_JSON_STRING TRIM UNNEST UPPER'.split(
     ' '
   )
 );
@@ -65,11 +71,19 @@ const syntaxCalls = new Set([
   'ON',
   'BY',
 ]);
+// Function names that read outside the warehouse. They are never valid, in any position.
+const forbiddenAnywhere = new Set(['EXTERNAL_QUERY', 'EXTERNAL_OBJECT_TRANSFORM']);
+// Statement keywords. They are rejected only where a statement could start, so columns named
+// model, set or load and functions such as REPLACE stay usable. The dry run's statementType check
+// remains the backstop.
 const forbidden = new Set(
-  'ALTER ASSERT BEGIN CALL COMMIT CREATE DECLARE DELETE DROP EXECUTE EXPORT GRANT IMPORT INSERT LOAD MERGE REPLACE REVOKE ROLLBACK SET TRUNCATE UPDATE EXTERNAL_QUERY EXTERNAL_OBJECT_TRANSFORM REMOTE MODEL'.split(
+  'ALTER ASSERT BEGIN BREAK CALL COMMIT CONTINUE CREATE DECLARE DELETE DROP EXECUTE EXPORT FOR GRANT IMPORT INSERT ITERATE LEAVE LOAD LOOP MERGE MODEL RAISE REMOTE REPEAT RETURN REVOKE ROLLBACK SET TRUNCATE UPDATE WHILE'.split(
     ' '
   )
 );
+// Words that can follow a column name, so `(set IS NULL)` is an expression rather than a statement.
+const operatorWords = new Set(['AS', 'AND', 'BETWEEN', 'IN', 'IS', 'LIKE', 'NOT', 'OR']);
+const setOperators = new Set(['UNION', 'INTERSECT', 'EXCEPT']);
 type Token = { value: string; kind: 'word' | 'quoted' | 'string' | 'symbol' };
 function tokens(sql: string): Token[] {
   const result: Token[] = [];
@@ -195,14 +209,30 @@ export function validateWarehouseSql(sql: string, project: string) {
         (quoted || parts[0] === project || parts[0].toLowerCase().startsWith('ultracart_dw')));
     if (tableLike && !allowedTable(parts)) throw new Error(tableScopeError);
   };
-  const frames: { from: boolean; fn?: string }[] = [{ from: false }];
+  const frames: { from: boolean; fn?: string; cte?: boolean }[] = [{ from: false }];
+  /** The token after a top-level CTE body, where the main statement starts. */
+  let statementAfterCte = -1;
+  const statementPosition = (i: number) => {
+    const before = parsed[i - 1]?.value.toUpperCase();
+    if (i === 0 || i === statementAfterCte) return true;
+    if (before && setOperators.has(before)) return true;
+    if ((before === 'ALL' || before === 'DISTINCT') && setOperators.has(parsed[i - 2]?.value.toUpperCase()))
+      return true;
+    if (before !== '(') return false;
+    // Inside parentheses, a keyword followed by a name or nothing starts a statement, e.g. `(DELETE FROM`.
+    const after = parsed[i + 1];
+    return !after || (isName(after) && !operatorWords.has(after.value.toUpperCase()));
+  };
   for (let i = 0; i < parsed.length; i++) {
     const token = parsed[i];
     const upper = token.value.toUpperCase();
     const frame = frames.at(-1)!;
     if (token.kind === 'string') continue;
     if (isName(token) && parsed[i - 1]?.value !== '.') expression(i);
-    if (token.kind === 'word' && forbidden.has(upper))
+    if (
+      token.kind === 'word' &&
+      (forbiddenAnywhere.has(upper) || (forbidden.has(upper) && statementPosition(i)))
+    )
       throw new Error(`The ${upper} operation is not supported in read-only queries.`);
     if (parsed[i + 1]?.value === '(' && isName(token)) {
       if (
@@ -217,12 +247,13 @@ export function validateWarehouseSql(sql: string, project: string) {
       frames.push({
         from: opensSource,
         fn: parsed[i - 1]?.kind === 'word' ? parsed[i - 1].value.toUpperCase() : undefined,
+        cte: frames.length === 1 && parsed[i - 1]?.value.toUpperCase() === 'AS',
       });
       // The first item of a parenthesized join is a FROM item too.
       if (opensSource && !['SELECT', 'WITH'].includes(parsed[i + 1]?.value.toUpperCase() ?? ''))
         source(i + 1);
     } else if (token.value === ')') {
-      frames.pop();
+      if (frames.pop()!.cte) statementAfterCte = i + 1;
       if (frames.length === 0) throw new Error('The query has an unmatched parenthesis.');
     } else if (token.kind === 'word' && (upper === 'FROM' || upper === 'JOIN')) {
       if (upper === 'FROM' && frame.fn === 'EXTRACT') continue;
@@ -469,7 +500,7 @@ export class WarehouseService {
             (value) => isAbsolute(value) && warehouseAbsolutePath(value),
             'Use an absolute path to bq on this computer.'
           ),
-        maxBytes: z.number().int().min(1).max(WAREHOUSE_MAX_BYTES),
+        maxBytes: byteCeiling,
       })
       .strict()
       .parse(input);

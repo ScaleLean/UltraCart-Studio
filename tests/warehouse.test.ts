@@ -12,6 +12,7 @@ import {
   warehouseAbsolutePath,
   warehouseDemoQueries,
   WAREHOUSE_DEFAULT_BYTES,
+  WAREHOUSE_MIN_BYTES,
 } from '../src/shared/warehouse';
 import {
   classifyWarehouseFailure,
@@ -40,7 +41,7 @@ const live: Workspace = {
 const query = {
   sql: 'SELECT COUNT(*) AS orders FROM ultracart_dw.uc_orders',
   rowLimit: 25,
-  maxBytes: 1024 ** 2,
+  maxBytes: 100 * 1024 ** 2,
 };
 const dry = (overrides: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -274,6 +275,63 @@ test('dry-run receipts accept curated uc_* views and their streaming sources onl
   );
 });
 
+test('statement keywords are rejected only at statement position, so valid SQL using them passes', () => {
+  const project = 'ultracart-dw-demo';
+  for (const sql of [
+    "SELECT REPLACE(name, 'x', 'y') AS name FROM ultracart_dw.uc_orders",
+    'SELECT * REPLACE (LOWER(channel) AS channel) FROM ultracart_dw.uc_orders',
+    'SELECT model, `set`, load FROM ultracart_dw.uc_orders',
+    'SELECT o.model, o.set, o.load FROM ultracart_dw.uc_orders o WHERE load > 1 AND (set IS NULL OR model = 2)',
+    'SELECT a, set, load FROM ultracart_dw.uc_orders ORDER BY model, set',
+    'SELECT MAX(load) AS model, COUNT(set) FROM ultracart_dw.uc_orders GROUP BY model',
+    'WITH model AS (SELECT load FROM ultracart_dw.uc_orders) SELECT load AS set FROM model',
+  ])
+    validateWarehouseSql(sql, project);
+  for (const sql of [
+    'DELETE FROM ultracart_dw.uc_orders WHERE TRUE',
+    'INSERT INTO ultracart_dw.uc_orders SELECT 1',
+    'WITH x AS (SELECT 1) DELETE FROM ultracart_dw.uc_orders WHERE TRUE',
+    'WITH x AS (SELECT 1), y AS (SELECT 2) INSERT INTO ultracart_dw.uc_orders SELECT 1',
+    'WITH x AS (SELECT 1) SET y = 1',
+    'WITH x AS (DELETE FROM ultracart_dw.uc_orders WHERE TRUE) SELECT 1',
+    'SELECT * FROM (DELETE FROM ultracart_dw.uc_orders WHERE TRUE)',
+    'SELECT * FROM (UPDATE ultracart_dw.uc_orders SET a = 1 WHERE TRUE)',
+    'SELECT * FROM (MERGE ultracart_dw.uc_orders USING ultracart_dw.uc_x ON TRUE)',
+    'SELECT * FROM (CREATE TABLE ultracart_dw.uc_t AS SELECT 1)',
+    'SELECT * FROM (DROP TABLE ultracart_dw.uc_orders)',
+    'SELECT * FROM (TRUNCATE TABLE ultracart_dw.uc_orders)',
+    "SELECT * FROM (EXECUTE IMMEDIATE 'SELECT 1')",
+    'SELECT * FROM (DECLARE x INT64)',
+    'SELECT * FROM (BEGIN TRANSACTION)',
+    'SELECT * FROM (LOAD DATA INTO ultracart_dw.uc_t FROM FILES)',
+    'SELECT 1 FROM ultracart_dw.uc_orders UNION ALL DELETE FROM ultracart_dw.uc_orders WHERE TRUE',
+    'SELECT 1 FROM ultracart_dw.uc_orders EXCEPT DISTINCT INSERT INTO ultracart_dw.uc_x SELECT 1',
+    'SELECT 1 FROM ultracart_dw.uc_orders UNION ALL (CALL proc())',
+    "SELECT EXTERNAL_QUERY('connection', 'SELECT 1')",
+    'SELECT external_query FROM ultracart_dw.uc_orders',
+  ])
+    assert.throws(() => validateWarehouseSql(sql, project), sql);
+  // The dry run still rejects any non-SELECT statement BigQuery reports.
+  for (const statementType of ['SCRIPT', 'INSERT', 'CREATE_TABLE_AS_SELECT', 'EXPORT_DATA'])
+    assert.throws(
+      () => parseWarehouseDryRun(dry({ statementType }), project, query.maxBytes, true),
+      /read-only SELECT/
+    );
+});
+
+test('byte ceilings below the 10 MiB BigQuery billing minimum are rejected', async () => {
+  const f = fixture();
+  for (const maxBytes of [1, 1000, WAREHOUSE_MIN_BYTES - 1]) {
+    assert.throws(() => f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes }), /10 MiB/);
+    await assert.rejects(f.warehouse.prepare({ workspaceId: live.id, ...query, maxBytes }), /10 MiB/);
+    assert.throws(() => f.warehouse.save({ workspaceId: live.id, name: 'Low', ...query, maxBytes }), /10 MiB/);
+  }
+  assert.equal(f.commands.length, 0);
+  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_MIN_BYTES });
+  const prepared = await f.warehouse.prepare({ workspaceId: live.id, ...query, maxBytes: WAREHOUSE_MIN_BYTES });
+  assert.equal(prepared.receipt.maxBytes, WAREHOUSE_MIN_BYTES);
+});
+
 test('EXTRACT date expressions preserve nested SELECT and JOIN scope checks', () => {
   const project = 'ultracart-dw-demo';
   assert.deepEqual(
@@ -370,7 +428,7 @@ test('warehouse tickets reject stale workspaces, changed identity, changed ceili
 
 test('a fresh dry-run boundary failure or a lowered merchant ceiling blocks query execution', async () => {
   const f = fixture();
-  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: 1000 });
+  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_MIN_BYTES });
   await assert.rejects(f.warehouse.prepare({ workspaceId: live.id, ...query }), /merchant scan ceiling/);
   assert.equal(f.commands.length, 0);
   f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_DEFAULT_BYTES });
@@ -516,6 +574,17 @@ test('the real process runner never returns raw account or token text on CLI fai
       return true;
     }
   );
+});
+
+test('the real process runner decodes UTF-8 characters split across output chunks', async () => {
+  const text = 'é'.repeat(70000) + '日本語🙂';
+  // Write the bytes in two pieces, cutting through the middle of a two-byte character.
+  const output = await runWarehouseCommand(process.execPath, [
+    '-e',
+    `const b = Buffer.from(${JSON.stringify(text)}); process.stdout.write(b.subarray(0, 70001), () => setTimeout(() => process.stdout.write(b.subarray(70001)), 20));`,
+  ]);
+  assert.equal(output, text);
+  assert.doesNotMatch(output, /\uFFFD/);
 });
 
 test('CLI failures provide specific actions for account, IAM, network, executable and query failures', () => {

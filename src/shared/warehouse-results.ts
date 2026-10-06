@@ -207,10 +207,14 @@ export function warehouseChartData(
   };
 }
 
+/** bq returns every number as a string. A plain decimal number cannot start a formula, so it is left as is. */
+const plainNumber = /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 function csvCell(value: unknown): string {
   let text = missing(value) ? '' : warehouseCellText(value);
   if (
     typeof value === 'string' &&
+    !plainNumber.test(text) &&
     (/^[\s\u0000-\u001f\u007f-\u009f]*[=+\-@＝＋－＠]/u.test(text) || /^[\t\r\n]/.test(text))
   ) {
     text = `'${text}`;

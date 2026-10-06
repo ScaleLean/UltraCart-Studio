@@ -232,7 +232,7 @@ test(
             name: 'Orders by channel for review',
             sql: 'SELECT channel, COUNT(*) AS orders FROM ultracart_dw.uc_orders GROUP BY channel',
             rowLimit: 50,
-            maxBytes: 1024 ** 2,
+            maxBytes: 10 * 1024 ** 2,
           }),
           { stopReason: 'toolUse' }
         ),
