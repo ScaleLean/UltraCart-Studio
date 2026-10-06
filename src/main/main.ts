@@ -15,7 +15,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync, cpSync 
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { StudioEvent } from '../shared/types';
+import type { Settings, StudioEvent } from '../shared/types';
 import { assertSecureCredentialStorage } from './secure-storage';
 
 app.setName('UltraCart Studio');
@@ -296,6 +296,26 @@ async function openPreview(params: any) {
   return { opened: true };
 }
 
+// The renderer never supplies executable paths. Main asks the user through a native dialog,
+// and the worker persists only the path the dialog returned.
+async function pickPath(kind: 'nodePath' | 'cliPath') {
+  const current: Settings = await call('settings.current');
+  const node = kind === 'nodePath';
+  const result = await dialog.showOpenDialog(win, {
+    title: node ? 'Choose the Node 24 executable' : 'Choose the UltraCart toolkit entry (dist/bin.js)',
+    defaultPath: current[kind] || undefined,
+    properties: ['openFile', 'showHiddenFiles'],
+    filters: node
+      ? process.platform === 'win32'
+        ? [{ name: 'Executable', extensions: ['exe'] }]
+        : undefined
+      : [{ name: 'JavaScript', extensions: ['js', 'mjs', 'cjs'] }],
+  });
+  const path = result.filePaths[0];
+  if (result.canceled || !path) return { changed: false, settings: current };
+  return { changed: path !== current[kind], settings: await call('settings.setPath', { kind, path }) };
+}
+
 ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) => {
   trusted(event);
   await ready;
@@ -309,6 +329,15 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
       ...result,
       auth: { ...result.auth, connected: false, phase: 'error', message: credentialLoadError },
     };
+  }
+  if (method === 'settings.pickNodePath') return pickPath('nodePath');
+  if (method === 'settings.pickCliPath') return pickPath('cliPath');
+  if (method === 'settings.save') {
+    const requested = z.object({ nodePath: z.string(), cliPath: z.string() }).passthrough().parse(params);
+    const current: Settings = await call('settings.current');
+    if (requested.nodePath !== current.nodePath || requested.cliPath !== current.cliPath)
+      throw new Error('Choose the Node and toolkit paths with the Browse buttons.');
+    return call(method, params);
   }
   if (publicMethods.has(method)) return call(method, params);
   if (method === 'preview.open') return openPreview(params);

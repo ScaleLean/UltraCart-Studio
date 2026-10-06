@@ -57,6 +57,21 @@ test('moving the app preserves configured toolkit paths when the new app has no 
     await f.cleanup();
   }
 });
+test('executable paths change only through savePath and must be absolute', async () => {
+  const f = await fixture();
+  try {
+    const before = f.service.settings();
+    const picked = join(f.directory, 'node');
+    const next = f.service.savePath('nodePath', picked);
+    assert.equal(next.nodePath, picked);
+    assert.equal(next.cliPath, before.cliPath);
+    assert.equal(f.service.settings().nodePath, picked);
+    assert.throws(() => f.service.savePath('cliPath', 'relative/bin.js'));
+    assert.equal(f.service.settings().cliPath, before.cliPath);
+  } finally {
+    await f.cleanup();
+  }
+});
 test('sample drafts persist, invalidate reviews, and restore as a new revision', async () => {
   const f = await fixture();
   try {

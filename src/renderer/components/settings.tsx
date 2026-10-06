@@ -68,6 +68,23 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
       setBusy(false);
     }
   }
+  async function pickPath(kind: 'nodePath' | 'cliPath') {
+    setBusy(true);
+    try {
+      const result = await invoke<{ changed: boolean; settings: Settings }>(
+        kind === 'nodePath' ? 'settings.pickNodePath' : 'settings.pickCliPath'
+      );
+      if (result.changed) {
+        setSettings((current) => ({ ...current, [kind]: result.settings[kind] }));
+        await refresh();
+        toast.success('Toolkit path saved');
+      }
+    } catch (e) {
+      toast.error(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
   async function login() {
     setBusy(true);
     try {
@@ -271,19 +288,21 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
                 <FieldGroup>
                   <Field>
                     <FieldLabel htmlFor="node-path">Node 24 executable</FieldLabel>
-                    <Input
-                      id="node-path"
-                      value={settings.nodePath}
-                      onChange={(event) => setSettings({ ...settings, nodePath: event.target.value })}
-                    />
+                    <div className="flex gap-2">
+                      <Input id="node-path" value={settings.nodePath} readOnly />
+                      <Button variant="outline" disabled={busy} onClick={() => void pickPath('nodePath')}>
+                        Browse
+                      </Button>
+                    </div>
                   </Field>
                   <Field>
                     <FieldLabel htmlFor="cli-path">UltraCart toolkit entry</FieldLabel>
-                    <Input
-                      id="cli-path"
-                      value={settings.cliPath}
-                      onChange={(event) => setSettings({ ...settings, cliPath: event.target.value })}
-                    />
+                    <div className="flex gap-2">
+                      <Input id="cli-path" value={settings.cliPath} readOnly />
+                      <Button variant="outline" disabled={busy} onClick={() => void pickPath('cliPath')}>
+                        Browse
+                      </Button>
+                    </div>
                   </Field>
                 </FieldGroup>
                 <div className="runtime-note">

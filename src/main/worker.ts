@@ -87,6 +87,16 @@ async function dispatch(method: string, input: any) {
       emit({ type: 'auth', status: await auth.status() });
       return settings;
     }
+    // Host-only methods: main calls these after a native file dialog. They are not in the public allowlist.
+    case 'settings.current':
+      return services.settings();
+    case 'settings.setPath': {
+      const v = z
+        .object({ kind: z.enum(['nodePath', 'cliPath']), path: z.string() })
+        .strict()
+        .parse(input);
+      return services.savePath(v.kind, v.path);
+    }
     case 'workspace.refresh':
       return services.refresh();
     case 'workspace.sample':
