@@ -137,6 +137,7 @@ export function WorkspaceCanvas({
   const [confirmation, setConfirmation] = useState('');
   const [abandonOpen, setAbandonOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState(0);
   const [idsOpen, setIdsOpen] = useState(false);
   const [history, setHistory] = useState<{ revision: number; at: string; changedFields: number }[]>([]);
   const [templates, setTemplates] = useState<TemplateResult | null>(null);
@@ -262,6 +263,7 @@ export function WorkspaceCanvas({
     if (!draft) return;
     try {
       setHistory(await invoke('draft.history', { path: page.path, slot, id: draft.id }));
+      setHistoryRevision(draft.revision);
       setHistoryOpen(true);
     } catch (error) {
       toast.error(errorText(error));
@@ -934,6 +936,7 @@ export function WorkspaceCanvas({
                         slot,
                         id: draft!.id,
                         revision: item.revision,
+                        expectedRevision: historyRevision,
                       });
                       setHistoryOpen(false);
                       toast.success('Restored as a new revision');

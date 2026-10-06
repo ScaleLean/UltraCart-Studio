@@ -73,7 +73,8 @@ test('sample drafts persist, invalidate reviews, and restore as a new revision',
     const review = await f.service.review(scope, edited.id, edited.revision);
     assert.equal(review.validation.valid, true);
     assert.equal(f.service.getChange(edited.id).status, 'reviewed');
-    const restored = await f.service.restore(scope, edited.id, 1);
+    await assert.rejects(f.service.restore(scope, edited.id, 1, 1), /changed in another window/);
+    const restored = await f.service.restore(scope, edited.id, 1, edited.revision);
     assert.equal(restored.revision, 3);
     assert.equal(restored.changedFields, 0);
     assert.equal(f.service.getChange(edited.id).review, null);

@@ -208,8 +208,8 @@ async function dispatch(method: string, input: any) {
       return services.history(v.id);
     }
     case 'draft.restore': {
-      const v = draftSchema.parse(input);
-      return services.restore(services.scope(v.path, v.slot), v.id, v.revision);
+      const v = draftSchema.extend({ expectedRevision: z.number().int().positive() }).parse(input);
+      return services.restore(services.scope(v.path, v.slot), v.id, v.revision, v.expectedRevision);
     }
     case 'draft.export': {
       const v = draftSchema.parse(input);

@@ -40,6 +40,7 @@ type Stored = {
   updatedAt: string;
 };
 type DraftDatabase = {
+  exec(sql: string): unknown;
   prepare(sql: string): {
     get(...values: string[]): unknown;
     run(...values: string[]): unknown;
@@ -249,9 +250,11 @@ export class DraftService {
   private pending = 0;
   private db: DraftDatabase;
   private toolkit: DraftToolkit;
-  constructor(db: DraftDatabase, toolkit: DraftToolkit) {
+  private onSave?: (record: Stored, draft: Draft) => void;
+  constructor(db: DraftDatabase, toolkit: DraftToolkit, onSave?: (record: Stored, draft: Draft) => void) {
     this.db = db;
     this.toolkit = toolkit;
+    this.onSave = onSave;
   }
   private serialized<T>(work: () => Promise<T>): Promise<T> {
     if (this.pending >= 8)
@@ -283,11 +286,20 @@ export class DraftService {
     return stored;
   }
   private save(record: Stored) {
-    this.db
-      .prepare(
-        'INSERT INTO storefront_drafts (scope_key, record) VALUES (?, ?) ON CONFLICT(scope_key) DO UPDATE SET record = excluded.record'
-      )
-      .run(scopeKey(record.scope), JSON.stringify(record));
+    // The draft and its revision snapshot commit together.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db
+        .prepare(
+          'INSERT INTO storefront_drafts (scope_key, record) VALUES (?, ?) ON CONFLICT(scope_key) DO UPDATE SET record = excluded.record'
+        )
+        .run(scopeKey(record.scope), JSON.stringify(record));
+      this.onSave?.(record, view(record));
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
   private async temporary<T>(action: (file: string) => Promise<T>) {
     const dir = await mkdtemp(join(tmpdir(), 'storefront-draft-'));

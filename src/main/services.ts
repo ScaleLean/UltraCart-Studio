@@ -121,8 +121,9 @@ export class StudioServices {
         .run(id, id, previousWorkspace.id);
     }
     this.connection = new ConnectionService(async () => this.settings());
-    this.drafts = new DraftService(store.db, this.connection);
-    this.sampleDrafts = new DraftService(store.db, sampleToolkit);
+    const snapshot = (record: Record, draft: Draft) => this.snapshot(record, draft);
+    this.drafts = new DraftService(store.db, this.connection, snapshot);
+    this.sampleDrafts = new DraftService(store.db, sampleToolkit, snapshot);
     this.widgetIds = new WidgetIdsService(this);
   }
   private draftService(scope: DraftScope) {
@@ -213,11 +214,13 @@ export class StudioServices {
     }
     throw new Error('Draft not found.');
   }
-  private remember(draft: Draft) {
-    const record = this.record(draft.id);
+  private snapshot(record: Record, draft: Draft) {
     this.store.db
       .prepare('INSERT OR IGNORE INTO revisions (draft_id, revision, value) VALUES (?, ?, ?)')
       .run(draft.id, draft.revision, JSON.stringify({ at: new Date().toISOString(), record, draft }));
+  }
+  private remember(draft: Draft) {
+    this.snapshot(this.record(draft.id), draft);
     return draft;
   }
   getChange(id: string): Change {
@@ -270,7 +273,7 @@ export class StudioServices {
   async save(input: unknown) {
     const v = draftSaveSchema.parse(input);
     this.assertEditable(v.id);
-    const draft = this.remember(await this.draftService(v).update(v, () => this.assertEditable(v.id)));
+    const draft = await this.draftService(v).update(v, () => this.assertEditable(v.id));
     this.store.log(
       workspaceId(v.selection),
       'draft',
@@ -291,9 +294,7 @@ export class StudioServices {
   async saveStructure(input: unknown) {
     const v = builderApplySchema.parse(input);
     this.assertEditable(v.id);
-    const draft = this.remember(
-      await this.draftService(v).updateStructure(v, () => this.assertEditable(v.id))
-    );
+    const draft = await this.draftService(v).updateStructure(v, () => this.assertEditable(v.id));
     this.store.log(
       workspaceId(v.selection),
       'draft',
@@ -369,9 +370,11 @@ export class StudioServices {
         return { revision: row.revision, at: v.at, changedFields: v.draft.changedFields };
       });
   }
-  async restore(scope: DraftScope, id: string, revision: number) {
+  async restore(scope: DraftScope, id: string, revision: number, expectedRevision: number) {
     const current = this.draftService(scope).read(scope);
     if (current?.id !== id) throw new Error('Draft scope mismatch.');
+    if (current.revision !== expectedRevision)
+      throw new Error('This draft changed in another window. Reload it before restoring.');
     const row = this.store.db
       .prepare('SELECT value FROM revisions WHERE draft_id = ? AND revision = ?')
       .get(id, revision);
@@ -379,11 +382,9 @@ export class StudioServices {
     const snapshot = JSON.parse(row.value as string) as { draft: Draft; record?: Record };
     if (typeof snapshot.record?.content === 'string') {
       this.assertEditable(id);
-      const draft = this.remember(
-        await this.draftService(scope).updateContent(
-          { ...scope, id, revision: current.revision, content: snapshot.record.content },
-          () => this.assertEditable(id)
-        )
+      const draft = await this.draftService(scope).updateContent(
+        { ...scope, id, revision: expectedRevision, content: snapshot.record.content },
+        () => this.assertEditable(id)
       );
       this.store.log(
         workspaceId(scope.selection),
@@ -398,7 +399,7 @@ export class StudioServices {
     return this.save({
       ...scope,
       id,
-      revision: current.revision,
+      revision: expectedRevision,
       edits: prior.fields.map((f) => ({ pointer: f.pointer, value: f.value })),
     });
   }
