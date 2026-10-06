@@ -54,6 +54,7 @@ const syntaxCalls = new Set([
   'OVER',
   'SELECT',
   'FROM',
+  'JOIN',
   'WHERE',
   'AND',
   'OR',
@@ -131,6 +132,10 @@ export function warehouseProject(merchant: string) {
   const id = merchant.toLowerCase();
   return id.startsWith('ultracart-dw-') ? id : `ultracart-dw-${id}`;
 }
+const tableScopeError =
+  'Queries can name only this merchant’s ultracart_dw.uc_* views. Use the schema explorer to choose a table.';
+const curatedTable = /^uc_[A-Za-z0-9_]{1,124}$/;
+const isName = (token: Token | undefined) => token?.kind === 'word' || token?.kind === 'quoted';
 export function validateWarehouseSql(sql: string, project: string) {
   const parsed = tokens(sql.trim());
   if (!['SELECT', 'WITH'].includes(parsed[0]?.value.toUpperCase()))
@@ -144,41 +149,62 @@ export function validateWarehouseSql(sql: string, project: string) {
     )
       ctes.add(parsed[i].value.toLowerCase());
   }
+  /** A dotted name, with backtick-quoted segments split on their dots, as BigQuery resolves table paths. */
+  const pathAt = (start: number) => {
+    const parts: string[] = [];
+    let quoted = false;
+    let end = start;
+    for (;;) {
+      quoted ||= parsed[end].kind === 'quoted';
+      parts.push(...parsed[end].value.split('.'));
+      if (parsed[end + 1]?.value !== '.' || !isName(parsed[end + 2])) break;
+      end += 2;
+    }
+    return { parts, quoted };
+  };
+  const allowedTable = (parts: string[]) =>
+    (parts.length === 2
+      ? parts[0] === 'ultracart_dw'
+      : parts.length === 3 && parts[0] === project && parts[1] === 'ultracart_dw') &&
+    curatedTable.test(parts.at(-1)!);
   const refs = new Set<string>();
-  const fromAt = new Map<number, boolean>();
-  const functionAt = new Map<number, string>();
-  let depth = 0;
+  /** Opening parentheses that start a FROM item: a parenthesized join or a subquery. */
+  const sourceParens = new Set<number>();
+  // Deny by default: a FROM item must be a CTE, UNNEST, a parenthesized item, or an allowed table.
   const source = (start: number) => {
     const first = parsed[start];
     if (!first) throw new Error('Choose a curated table after FROM or JOIN.');
-    if (first.value === '(' || first.value.toUpperCase() === 'UNNEST') return;
-    if (!['word', 'quoted'].includes(first.kind)) throw new Error('Use an exact curated table name.');
-    let path = first.value;
-    let j = start;
-    while (parsed[j + 1]?.value === '.' && ['word', 'quoted'].includes(parsed[j + 2]?.kind)) {
-      path += '.' + parsed[j + 2].value;
-      j += 2;
+    if (first.value === '(') {
+      sourceParens.add(start);
+      return;
     }
-    const parts = path.split('.');
-    if (parts.length === 1 && ctes.has(parts[0].toLowerCase())) return;
-    const own =
-      parts.length === 2
-        ? parts[0] === 'ultracart_dw'
-        : parts.length === 3 && parts[0] === project && parts[1] === 'ultracart_dw';
-    const name = parts.at(-1)!;
-    if (!own || !/^uc_[A-Za-z0-9_]{1,124}$/.test(name))
-      throw new Error(
-        'Queries can name only this merchant’s ultracart_dw.uc_* views. Use the schema explorer to choose a table.'
-      );
-    refs.add(`${project}.ultracart_dw.${name}`);
+    if (first.kind === 'word' && first.value.toUpperCase() === 'UNNEST' && parsed[start + 1]?.value === '(')
+      return;
+    if (!isName(first)) throw new Error('Use an exact curated table name.');
+    const { parts } = pathAt(start);
+    if (parts.length === 1 && first.kind === 'word' && ctes.has(parts[0].toLowerCase())) return;
+    if (!allowedTable(parts)) throw new Error(tableScopeError);
+    refs.add(`${project}.ultracart_dw.${parts.at(-1)}`);
   };
+  // Outside FROM items a dotted name is a column path. Reject any that could only name a table.
+  const expression = (start: number) => {
+    const { parts, quoted } = pathAt(start);
+    const tableLike =
+      parts.some((part) => part === '' || part.includes('-') || part.toUpperCase() === 'INFORMATION_SCHEMA') ||
+      (parts.length > 1 &&
+        (quoted || parts[0] === project || parts[0].toLowerCase().startsWith('ultracart_dw')));
+    if (tableLike && !allowedTable(parts)) throw new Error(tableScopeError);
+  };
+  const frames: { from: boolean; fn?: string }[] = [{ from: false }];
   for (let i = 0; i < parsed.length; i++) {
     const token = parsed[i];
     const upper = token.value.toUpperCase();
+    const frame = frames.at(-1)!;
     if (token.kind === 'string') continue;
+    if (isName(token) && parsed[i - 1]?.value !== '.') expression(i);
     if (token.kind === 'word' && forbidden.has(upper))
       throw new Error(`The ${upper} operation is not supported in read-only queries.`);
-    if (parsed[i + 1]?.value === '(' && ['word', 'quoted'].includes(token.kind)) {
+    if (parsed[i + 1]?.value === '(' && isName(token)) {
       if (
         token.kind === 'quoted' ||
         parsed[i - 1]?.value === '.' ||
@@ -187,18 +213,23 @@ export function validateWarehouseSql(sql: string, project: string) {
         throw new Error(`The function ${token.value} is outside the supported read-only SQL subset.`);
     }
     if (token.value === '(') {
-      depth++;
-      fromAt.set(depth, false);
-      if (parsed[i - 1]?.kind === 'word') functionAt.set(depth, parsed[i - 1].value.toUpperCase());
+      const opensSource = sourceParens.has(i);
+      frames.push({
+        from: opensSource,
+        fn: parsed[i - 1]?.kind === 'word' ? parsed[i - 1].value.toUpperCase() : undefined,
+      });
+      // The first item of a parenthesized join is a FROM item too.
+      if (opensSource && !['SELECT', 'WITH'].includes(parsed[i + 1]?.value.toUpperCase() ?? ''))
+        source(i + 1);
     } else if (token.value === ')') {
-      fromAt.delete(depth);
-      functionAt.delete(depth);
-      depth--;
-      if (depth < 0) throw new Error('The query has an unmatched parenthesis.');
+      frames.pop();
+      if (frames.length === 0) throw new Error('The query has an unmatched parenthesis.');
     } else if (token.kind === 'word' && (upper === 'FROM' || upper === 'JOIN')) {
-      if (upper === 'FROM' && functionAt.get(depth) === 'EXTRACT') continue;
-      fromAt.set(depth, true);
+      if (upper === 'FROM' && frame.fn === 'EXTRACT') continue;
+      frame.from = true;
       source(i + 1);
+    } else if (token.kind === 'word' && upper === 'SELECT') {
+      frame.from = false;
     } else if (
       token.kind === 'word' &&
       [
@@ -214,10 +245,10 @@ export function validateWarehouseSql(sql: string, project: string) {
         'WINDOW',
       ].includes(upper)
     )
-      fromAt.set(depth, false);
-    else if (token.value === ',' && fromAt.get(depth)) source(i + 1);
+      frame.from = false;
+    else if (token.value === ',' && frame.from) source(i + 1);
   }
-  if (depth !== 0) throw new Error('The query has an unmatched parenthesis.');
+  if (frames.length !== 1) throw new Error('The query has an unmatched parenthesis.');
   return [...refs];
 }
 export function boundedWarehouseSql(query: WarehouseQuery, project: string) {
@@ -250,13 +281,19 @@ export function parseWarehouseDryRun(text: string, project: string, maxBytes: nu
   const references = stats.referencedTables ?? [];
   if (!Array.isArray(references) || references.length > 1000)
     throw new Error('BigQuery returned an invalid table receipt.');
+  // A query that names no curated view must not read any table. If it does, the SQL check missed a reference.
+  if (!needsTables && references.length > 0)
+    throw new Error('BigQuery reported tables this query does not name. No query was executed.');
   const referencedTables = references.map((ref: any) => {
-    if (
-      ref?.projectId !== project ||
-      !['ultracart_dw', 'ultracart_dw_streaming'].includes(ref?.datasetId) ||
-      typeof ref?.tableId !== 'string' ||
-      !/^[A-Za-z0-9_]{1,1024}$/.test(ref.tableId)
-    )
+    const tableId = typeof ref?.tableId === 'string' ? ref.tableId : '';
+    // Curated ultracart_dw.uc_* views read base tables in ultracart_dw_streaming, and BigQuery reports those
+    // base tables as referenced. They are accepted here only as view sources: validateWarehouseSql never lets
+    // SQL name ultracart_dw_streaming (or any non-uc_* table) directly.
+    const permitted =
+      ref?.projectId === project &&
+      ((ref?.datasetId === 'ultracart_dw' && curatedTable.test(tableId)) ||
+        (ref?.datasetId === 'ultracart_dw_streaming' && /^[A-Za-z0-9_]{1,1024}$/.test(tableId)));
+    if (!permitted)
       throw new Error('This query resolves outside the selected merchant’s permitted warehouse datasets.');
     return `${ref.projectId}.${ref.datasetId}.${ref.tableId}`;
   });

@@ -146,6 +146,134 @@ test('warehouse SQL allows scoped SELECT/CTEs and refuses writes, external funct
     assert.throws(() => validateWarehouseSql(sql, project), sql);
 });
 
+test('parenthesized joins validate every table, including the first item and nested parentheses', () => {
+  const project = 'ultracart-dw-demo';
+  for (const sql of [
+    // Issue #18 reproductions.
+    'SELECT 1 FROM (`ultracart-dw-other.ultracart_dw.uc_orders` CROSS JOIN ultracart_dw.uc_x)',
+    'SELECT 1 FROM (`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT CROSS JOIN ultracart_dw.uc_x)',
+    'SELECT 1 FROM ((`ultracart-dw-other.ultracart_dw.uc_orders` CROSS JOIN ultracart_dw.uc_x))',
+    'SELECT 1 FROM ((ultracart_dw_streaming.raw_orders JOIN ultracart_dw.uc_x ON TRUE) CROSS JOIN ultracart_dw.uc_y)',
+    'SELECT 1 FROM ultracart_dw.uc_x JOIN (secret.customers CROSS JOIN ultracart_dw.uc_y) ON TRUE',
+    'SELECT 1 FROM ultracart_dw.uc_x, (ultracart_dw_streaming.uc_orders CROSS JOIN ultracart_dw.uc_y)',
+    'SELECT 1 FROM (ultracart_dw.uc_x, secret.customers)',
+    'SELECT 1 FROM ((ultracart_dw.uc_x, (`other-project`.ultracart_dw.uc_y)))',
+  ])
+    assert.throws(() => validateWarehouseSql(sql, project), /ultracart_dw\.uc_\*/, sql);
+  assert.deepEqual(
+    validateWarehouseSql(
+      'SELECT 1 FROM ((ultracart_dw.uc_a CROSS JOIN `ultracart-dw-demo.ultracart_dw.uc_b`) JOIN ultracart_dw.uc_c ON TRUE)',
+      project
+    ),
+    [
+      'ultracart-dw-demo.ultracart_dw.uc_a',
+      'ultracart-dw-demo.ultracart_dw.uc_b',
+      'ultracart-dw-demo.ultracart_dw.uc_c',
+    ]
+  );
+});
+
+test('table references are deny-by-default against adversarial paths, qualifiers and positions', () => {
+  const project = 'ultracart-dw-demo';
+  const rejected = {
+    'INFORMATION_SCHEMA': [
+      'SELECT * FROM ultracart_dw.INFORMATION_SCHEMA.TABLES',
+      'SELECT * FROM `ultracart-dw-demo`.ultracart_dw.INFORMATION_SCHEMA.COLUMNS',
+      'SELECT * FROM INFORMATION_SCHEMA.SCHEMATA',
+      'SELECT * FROM `ultracart-dw-demo.INFORMATION_SCHEMA.SCHEMATA`',
+      'SELECT * FROM ultracart_dw.uc_a WHERE EXISTS (SELECT 1 FROM ultracart_dw.INFORMATION_SCHEMA.TABLES)',
+      'SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA) FROM ultracart_dw.uc_a',
+    ],
+    'region qualifiers': [
+      'SELECT * FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT',
+      'SELECT * FROM `region-us.INFORMATION_SCHEMA.JOBS`',
+      'SELECT * FROM region-us.INFORMATION_SCHEMA.JOBS',
+      'SELECT * FROM `ultracart-dw-demo`.`region-eu`.INFORMATION_SCHEMA.JOBS',
+    ],
+    'UNNEST of table paths': [
+      'SELECT * FROM UNNEST(`ultracart-dw-other.ultracart_dw.uc_orders`)',
+      'SELECT * FROM UNNEST(ultracart_dw_streaming.raw_orders)',
+      'SELECT x FROM ultracart_dw.uc_a, UNNEST(`ultracart-dw-demo`.ultracart_dw_streaming.orders) x',
+      'SELECT x FROM ultracart_dw.uc_a a, UNNEST(ultracart_dw.raw_orders) x',
+      'SELECT 1 FROM ultracart_dw.uc_a WHERE 1 IN UNNEST(`region-us`.INFORMATION_SCHEMA.JOBS)',
+    ],
+    'comma joins inside parentheses': [
+      'SELECT 1 FROM (ultracart_dw.uc_x a, (other.t) b)',
+      'SELECT 1 FROM ((ultracart_dw.uc_x), (ultracart_dw.uc_y, ultracart_dw_streaming.uc_z))',
+      'SELECT 1 FROM ultracart_dw.uc_x JOIN (ultracart_dw.uc_y, secret.t) ON TRUE',
+    ],
+    'subqueries in JOIN ON': [
+      'SELECT 1 FROM ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON a.id IN (SELECT id FROM secret.customers)',
+      'SELECT 1 FROM ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON EXISTS (SELECT 1 FROM (`p-x.ultracart_dw.uc_a` CROSS JOIN ultracart_dw.uc_b))',
+      'SELECT 1 FROM ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON a.id = (SELECT MAX(id) FROM ultracart_dw.uc_c, ultracart_dw_streaming.c)',
+    ],
+    'backtick-quoted full paths': [
+      'SELECT * FROM `ultracart-dw-other.ultracart_dw.uc_orders`',
+      'SELECT * FROM `ultracart-dw-demo.ultracart_dw_streaming.uc_orders`',
+      'SELECT * FROM `ultracart-dw-demo`.`ultracart_dw_streaming`.`uc_orders`',
+      'SELECT * FROM `ultracart_dw.raw_orders`',
+      'SELECT * FROM `ultracart_dw`.`uc_orders.extra`',
+      'SELECT * FROM `ultracart_dw..uc_orders`',
+      'SELECT * FROM `.ultracart_dw.uc_orders`',
+      'SELECT `ultracart-dw-other.ultracart_dw.uc_orders`.total FROM ultracart_dw.uc_a',
+      'SELECT `other.dataset`.col FROM ultracart_dw.uc_a',
+    ],
+    'implicit dataset-qualified names': [
+      'SELECT * FROM ultracart_dw_streaming.uc_orders',
+      'SELECT * FROM secret.customers',
+      'SELECT * FROM uc_orders',
+      'SELECT * FROM ultracart_dw.orders',
+      'SELECT * FROM ULTRACART_DW.uc_orders',
+      'SELECT * FROM ultracart_dw.uc_a a, a.items',
+      'WITH uc_x AS (SELECT 1) SELECT * FROM uc_x, secret.t',
+      'SELECT ultracart_dw_streaming.raw.col FROM ultracart_dw.uc_a',
+    ],
+    'subqueries and CTEs as FROM items': [
+      'SELECT * FROM (SELECT * FROM secret.customers)',
+      'SELECT * FROM ((SELECT 1) CROSS JOIN secret.t)',
+      'SELECT * FROM (WITH x AS (SELECT 1) SELECT * FROM x, secret.t)',
+      'WITH x AS (SELECT * FROM (ultracart_dw_streaming.raw JOIN ultracart_dw.uc_a ON TRUE)) SELECT * FROM x',
+    ],
+  };
+  for (const [group, list] of Object.entries(rejected))
+    for (const sql of list) assert.throws(() => validateWarehouseSql(sql, project), `${group}: ${sql}`);
+  for (const sql of [
+    'SELECT o.total FROM ultracart_dw.uc_orders o JOIN (SELECT order_id FROM ultracart_dw.uc_items) i ON o.order_id = i.order_id',
+    'SELECT shipping.address.city, o.billing.zip FROM ultracart_dw.uc_orders o',
+    'SELECT a.id FROM (ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON a.id = b.id)',
+    'SELECT COUNT(*) FROM ultracart_dw.uc_orders o, UNNEST(o.items) i',
+    'SELECT x.n FROM (SELECT 1 AS n, 2 AS m) x',
+    'WITH a AS (SELECT 1 AS n), b AS (SELECT n FROM a) SELECT * FROM (a CROSS JOIN b)',
+    "SELECT 'region-us.INFORMATION_SCHEMA.JOBS' AS label FROM ultracart_dw.uc_a",
+  ])
+    validateWarehouseSql(sql, project);
+});
+
+test('dry-run receipts accept curated uc_* views and their streaming sources only', () => {
+  const project = 'ultracart-dw-demo';
+  const tables = (...refs: [string, string][]) =>
+    dry({ referencedTables: refs.map(([datasetId, tableId]) => ({ projectId: project, datasetId, tableId })) });
+  assert.deepEqual(
+    parseWarehouseDryRun(tables(['ultracart_dw', 'uc_orders'], ['ultracart_dw_streaming', 'orders']), project, query.maxBytes, true)
+      .referencedTables,
+    ['ultracart-dw-demo.ultracart_dw.uc_orders', 'ultracart-dw-demo.ultracart_dw_streaming.orders']
+  );
+  for (const text of [
+    tables(['ultracart_dw', 'orders']),
+    tables(['ultracart_dw', 'UC_orders']),
+    tables(['ultracart_dw', 'INFORMATION_SCHEMA']),
+    tables(['ultracart_dw_high', 'uc_orders']),
+    tables(['ultracart_dw_streaming', 'bad-name']),
+    tables(['ultracart_dw', 'uc_orders'], ['other', 'uc_orders']),
+  ])
+    assert.throws(() => parseWarehouseDryRun(text, project, query.maxBytes, true), text);
+  // SQL that names no curated view must not resolve to any table at all.
+  assert.throws(
+    () => parseWarehouseDryRun(tables(['ultracart_dw_streaming', 'orders']), project, query.maxBytes, false),
+    /does not name/
+  );
+});
+
 test('EXTRACT date expressions preserve nested SELECT and JOIN scope checks', () => {
   const project = 'ultracart-dw-demo';
   assert.deepEqual(
