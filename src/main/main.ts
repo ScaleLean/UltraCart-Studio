@@ -506,11 +506,25 @@ app.whenReady().then(async () => {
   win.show();
 });
 let quitConfirmed = false;
+let quitAsking = false;
 // Ask the renderer about unsaved edits before anything is torn down; cancelling keeps a live engine.
 async function confirmQuit() {
+  if (quitAsking) return;
+  quitAsking = true;
+  try {
+    await askQuit();
+  } finally {
+    quitAsking = false;
+  }
+}
+async function askQuit() {
   let unsaved = false;
   try {
-    unsaved = !!(await win.webContents.executeJavaScript('window.__studioHasUnsaved?.() === true'));
+    // A hung renderer must not block quitting, so an unanswered check counts as no unsaved edits.
+    unsaved = !!(await Promise.race([
+      win.webContents.executeJavaScript('window.__studioHasUnsaved?.() === true'),
+      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+    ]));
   } catch {}
   if (unsaved) {
     win.show();
