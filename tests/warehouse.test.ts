@@ -12,6 +12,7 @@ import {
   warehouseAbsolutePath,
   warehouseDemoQueries,
   WAREHOUSE_DEFAULT_BYTES,
+  WAREHOUSE_MIN_BYTES,
 } from '../src/shared/warehouse';
 import {
   classifyWarehouseFailure,
@@ -40,7 +41,7 @@ const live: Workspace = {
 const query = {
   sql: 'SELECT COUNT(*) AS orders FROM ultracart_dw.uc_orders',
   rowLimit: 25,
-  maxBytes: 1024 ** 2,
+  maxBytes: 100 * 1024 ** 2,
 };
 const dry = (overrides: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -146,6 +147,191 @@ test('warehouse SQL allows scoped SELECT/CTEs and refuses writes, external funct
     assert.throws(() => validateWarehouseSql(sql, project), sql);
 });
 
+test('parenthesized joins validate every table, including the first item and nested parentheses', () => {
+  const project = 'ultracart-dw-demo';
+  for (const sql of [
+    // Issue #18 reproductions.
+    'SELECT 1 FROM (`ultracart-dw-other.ultracart_dw.uc_orders` CROSS JOIN ultracart_dw.uc_x)',
+    'SELECT 1 FROM (`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT CROSS JOIN ultracart_dw.uc_x)',
+    'SELECT 1 FROM ((`ultracart-dw-other.ultracart_dw.uc_orders` CROSS JOIN ultracart_dw.uc_x))',
+    'SELECT 1 FROM ((ultracart_dw_streaming.raw_orders JOIN ultracart_dw.uc_x ON TRUE) CROSS JOIN ultracart_dw.uc_y)',
+    'SELECT 1 FROM ultracart_dw.uc_x JOIN (secret.customers CROSS JOIN ultracart_dw.uc_y) ON TRUE',
+    'SELECT 1 FROM ultracart_dw.uc_x, (ultracart_dw_streaming.uc_orders CROSS JOIN ultracart_dw.uc_y)',
+    'SELECT 1 FROM (ultracart_dw.uc_x, secret.customers)',
+    'SELECT 1 FROM ((ultracart_dw.uc_x, (`other-project`.ultracart_dw.uc_y)))',
+  ])
+    assert.throws(() => validateWarehouseSql(sql, project), /ultracart_dw\.uc_\*/, sql);
+  assert.deepEqual(
+    validateWarehouseSql(
+      'SELECT 1 FROM ((ultracart_dw.uc_a CROSS JOIN `ultracart-dw-demo.ultracart_dw.uc_b`) JOIN ultracart_dw.uc_c ON TRUE)',
+      project
+    ),
+    [
+      'ultracart-dw-demo.ultracart_dw.uc_a',
+      'ultracart-dw-demo.ultracart_dw.uc_b',
+      'ultracart-dw-demo.ultracart_dw.uc_c',
+    ]
+  );
+});
+
+test('table references are deny-by-default against adversarial paths, qualifiers and positions', () => {
+  const project = 'ultracart-dw-demo';
+  const rejected = {
+    'INFORMATION_SCHEMA': [
+      'SELECT * FROM ultracart_dw.INFORMATION_SCHEMA.TABLES',
+      'SELECT * FROM `ultracart-dw-demo`.ultracart_dw.INFORMATION_SCHEMA.COLUMNS',
+      'SELECT * FROM INFORMATION_SCHEMA.SCHEMATA',
+      'SELECT * FROM `ultracart-dw-demo.INFORMATION_SCHEMA.SCHEMATA`',
+      'SELECT * FROM ultracart_dw.uc_a WHERE EXISTS (SELECT 1 FROM ultracart_dw.INFORMATION_SCHEMA.TABLES)',
+      'SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA) FROM ultracart_dw.uc_a',
+    ],
+    'region qualifiers': [
+      'SELECT * FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT',
+      'SELECT * FROM `region-us.INFORMATION_SCHEMA.JOBS`',
+      'SELECT * FROM region-us.INFORMATION_SCHEMA.JOBS',
+      'SELECT * FROM `ultracart-dw-demo`.`region-eu`.INFORMATION_SCHEMA.JOBS',
+    ],
+    'UNNEST of table paths': [
+      'SELECT * FROM UNNEST(`ultracart-dw-other.ultracart_dw.uc_orders`)',
+      'SELECT * FROM UNNEST(ultracart_dw_streaming.raw_orders)',
+      'SELECT x FROM ultracart_dw.uc_a, UNNEST(`ultracart-dw-demo`.ultracart_dw_streaming.orders) x',
+      'SELECT x FROM ultracart_dw.uc_a a, UNNEST(ultracart_dw.raw_orders) x',
+      'SELECT 1 FROM ultracart_dw.uc_a WHERE 1 IN UNNEST(`region-us`.INFORMATION_SCHEMA.JOBS)',
+    ],
+    'comma joins inside parentheses': [
+      'SELECT 1 FROM (ultracart_dw.uc_x a, (other.t) b)',
+      'SELECT 1 FROM ((ultracart_dw.uc_x), (ultracart_dw.uc_y, ultracart_dw_streaming.uc_z))',
+      'SELECT 1 FROM ultracart_dw.uc_x JOIN (ultracart_dw.uc_y, secret.t) ON TRUE',
+    ],
+    'subqueries in JOIN ON': [
+      'SELECT 1 FROM ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON a.id IN (SELECT id FROM secret.customers)',
+      'SELECT 1 FROM ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON EXISTS (SELECT 1 FROM (`p-x.ultracart_dw.uc_a` CROSS JOIN ultracart_dw.uc_b))',
+      'SELECT 1 FROM ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON a.id = (SELECT MAX(id) FROM ultracart_dw.uc_c, ultracart_dw_streaming.c)',
+    ],
+    'backtick-quoted full paths': [
+      'SELECT * FROM `ultracart-dw-other.ultracart_dw.uc_orders`',
+      'SELECT * FROM `ultracart-dw-demo.ultracart_dw_streaming.uc_orders`',
+      'SELECT * FROM `ultracart-dw-demo`.`ultracart_dw_streaming`.`uc_orders`',
+      'SELECT * FROM `ultracart_dw.raw_orders`',
+      'SELECT * FROM `ultracart_dw`.`uc_orders.extra`',
+      'SELECT * FROM `ultracart_dw..uc_orders`',
+      'SELECT * FROM `.ultracart_dw.uc_orders`',
+      'SELECT `ultracart-dw-other.ultracart_dw.uc_orders`.total FROM ultracart_dw.uc_a',
+      'SELECT `other.dataset`.col FROM ultracart_dw.uc_a',
+    ],
+    'implicit dataset-qualified names': [
+      'SELECT * FROM ultracart_dw_streaming.uc_orders',
+      'SELECT * FROM secret.customers',
+      'SELECT * FROM uc_orders',
+      'SELECT * FROM ultracart_dw.orders',
+      'SELECT * FROM ULTRACART_DW.uc_orders',
+      'SELECT * FROM ultracart_dw.uc_a a, a.items',
+      'WITH uc_x AS (SELECT 1) SELECT * FROM uc_x, secret.t',
+      'SELECT ultracart_dw_streaming.raw.col FROM ultracart_dw.uc_a',
+    ],
+    'subqueries and CTEs as FROM items': [
+      'SELECT * FROM (SELECT * FROM secret.customers)',
+      'SELECT * FROM ((SELECT 1) CROSS JOIN secret.t)',
+      'SELECT * FROM (WITH x AS (SELECT 1) SELECT * FROM x, secret.t)',
+      'WITH x AS (SELECT * FROM (ultracart_dw_streaming.raw JOIN ultracart_dw.uc_a ON TRUE)) SELECT * FROM x',
+    ],
+  };
+  for (const [group, list] of Object.entries(rejected))
+    for (const sql of list) assert.throws(() => validateWarehouseSql(sql, project), `${group}: ${sql}`);
+  for (const sql of [
+    'SELECT o.total FROM ultracart_dw.uc_orders o JOIN (SELECT order_id FROM ultracart_dw.uc_items) i ON o.order_id = i.order_id',
+    'SELECT shipping.address.city, o.billing.zip FROM ultracart_dw.uc_orders o',
+    'SELECT a.id FROM (ultracart_dw.uc_a a JOIN ultracart_dw.uc_b b ON a.id = b.id)',
+    'SELECT COUNT(*) FROM ultracart_dw.uc_orders o, UNNEST(o.items) i',
+    'SELECT x.n FROM (SELECT 1 AS n, 2 AS m) x',
+    'WITH a AS (SELECT 1 AS n), b AS (SELECT n FROM a) SELECT * FROM (a CROSS JOIN b)',
+    "SELECT 'region-us.INFORMATION_SCHEMA.JOBS' AS label FROM ultracart_dw.uc_a",
+  ])
+    validateWarehouseSql(sql, project);
+});
+
+test('dry-run receipts accept curated uc_* views and their streaming sources only', () => {
+  const project = 'ultracart-dw-demo';
+  const tables = (...refs: [string, string][]) =>
+    dry({ referencedTables: refs.map(([datasetId, tableId]) => ({ projectId: project, datasetId, tableId })) });
+  assert.deepEqual(
+    parseWarehouseDryRun(tables(['ultracart_dw', 'uc_orders'], ['ultracart_dw_streaming', 'orders']), project, query.maxBytes, true)
+      .referencedTables,
+    ['ultracart-dw-demo.ultracart_dw.uc_orders', 'ultracart-dw-demo.ultracart_dw_streaming.orders']
+  );
+  for (const text of [
+    tables(['ultracart_dw', 'orders']),
+    tables(['ultracart_dw', 'UC_orders']),
+    tables(['ultracart_dw', 'INFORMATION_SCHEMA']),
+    tables(['ultracart_dw_high', 'uc_orders']),
+    tables(['ultracart_dw_streaming', 'bad-name']),
+    tables(['ultracart_dw', 'uc_orders'], ['other', 'uc_orders']),
+  ])
+    assert.throws(() => parseWarehouseDryRun(text, project, query.maxBytes, true), text);
+  // SQL that names no curated view must not resolve to any table at all.
+  assert.throws(
+    () => parseWarehouseDryRun(tables(['ultracart_dw_streaming', 'orders']), project, query.maxBytes, false),
+    /does not name/
+  );
+});
+
+test('statement keywords are rejected only at statement position, so valid SQL using them passes', () => {
+  const project = 'ultracart-dw-demo';
+  for (const sql of [
+    "SELECT REPLACE(name, 'x', 'y') AS name FROM ultracart_dw.uc_orders",
+    'SELECT * REPLACE (LOWER(channel) AS channel) FROM ultracart_dw.uc_orders',
+    'SELECT model, `set`, load FROM ultracart_dw.uc_orders',
+    'SELECT o.model, o.set, o.load FROM ultracart_dw.uc_orders o WHERE load > 1 AND (set IS NULL OR model = 2)',
+    'SELECT a, set, load FROM ultracart_dw.uc_orders ORDER BY model, set',
+    'SELECT MAX(load) AS model, COUNT(set) FROM ultracart_dw.uc_orders GROUP BY model',
+    'WITH model AS (SELECT load FROM ultracart_dw.uc_orders) SELECT load AS set FROM model',
+  ])
+    validateWarehouseSql(sql, project);
+  for (const sql of [
+    'DELETE FROM ultracart_dw.uc_orders WHERE TRUE',
+    'INSERT INTO ultracart_dw.uc_orders SELECT 1',
+    'WITH x AS (SELECT 1) DELETE FROM ultracart_dw.uc_orders WHERE TRUE',
+    'WITH x AS (SELECT 1), y AS (SELECT 2) INSERT INTO ultracart_dw.uc_orders SELECT 1',
+    'WITH x AS (SELECT 1) SET y = 1',
+    'WITH x AS (DELETE FROM ultracart_dw.uc_orders WHERE TRUE) SELECT 1',
+    'SELECT * FROM (DELETE FROM ultracart_dw.uc_orders WHERE TRUE)',
+    'SELECT * FROM (UPDATE ultracart_dw.uc_orders SET a = 1 WHERE TRUE)',
+    'SELECT * FROM (MERGE ultracart_dw.uc_orders USING ultracart_dw.uc_x ON TRUE)',
+    'SELECT * FROM (CREATE TABLE ultracart_dw.uc_t AS SELECT 1)',
+    'SELECT * FROM (DROP TABLE ultracart_dw.uc_orders)',
+    'SELECT * FROM (TRUNCATE TABLE ultracart_dw.uc_orders)',
+    "SELECT * FROM (EXECUTE IMMEDIATE 'SELECT 1')",
+    'SELECT * FROM (DECLARE x INT64)',
+    'SELECT * FROM (BEGIN TRANSACTION)',
+    'SELECT * FROM (LOAD DATA INTO ultracart_dw.uc_t FROM FILES)',
+    'SELECT 1 FROM ultracart_dw.uc_orders UNION ALL DELETE FROM ultracart_dw.uc_orders WHERE TRUE',
+    'SELECT 1 FROM ultracart_dw.uc_orders EXCEPT DISTINCT INSERT INTO ultracart_dw.uc_x SELECT 1',
+    'SELECT 1 FROM ultracart_dw.uc_orders UNION ALL (CALL proc())',
+    "SELECT EXTERNAL_QUERY('connection', 'SELECT 1')",
+    'SELECT external_query FROM ultracart_dw.uc_orders',
+  ])
+    assert.throws(() => validateWarehouseSql(sql, project), sql);
+  // The dry run still rejects any non-SELECT statement BigQuery reports.
+  for (const statementType of ['SCRIPT', 'INSERT', 'CREATE_TABLE_AS_SELECT', 'EXPORT_DATA'])
+    assert.throws(
+      () => parseWarehouseDryRun(dry({ statementType }), project, query.maxBytes, true),
+      /read-only SELECT/
+    );
+});
+
+test('byte ceilings below the 10 MiB BigQuery billing minimum are rejected', async () => {
+  const f = fixture();
+  for (const maxBytes of [1, 1000, WAREHOUSE_MIN_BYTES - 1]) {
+    assert.throws(() => f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes }), /10 MiB/);
+    await assert.rejects(f.warehouse.prepare({ workspaceId: live.id, ...query, maxBytes }), /10 MiB/);
+    assert.throws(() => f.warehouse.save({ workspaceId: live.id, name: 'Low', ...query, maxBytes }), /10 MiB/);
+  }
+  assert.equal(f.commands.length, 0);
+  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_MIN_BYTES });
+  const prepared = await f.warehouse.prepare({ workspaceId: live.id, ...query, maxBytes: WAREHOUSE_MIN_BYTES });
+  assert.equal(prepared.receipt.maxBytes, WAREHOUSE_MIN_BYTES);
+});
+
 test('EXTRACT date expressions preserve nested SELECT and JOIN scope checks', () => {
   const project = 'ultracart-dw-demo';
   assert.deepEqual(
@@ -242,7 +428,7 @@ test('warehouse tickets reject stale workspaces, changed identity, changed ceili
 
 test('a fresh dry-run boundary failure or a lowered merchant ceiling blocks query execution', async () => {
   const f = fixture();
-  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: 1000 });
+  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_MIN_BYTES });
   await assert.rejects(f.warehouse.prepare({ workspaceId: live.id, ...query }), /merchant scan ceiling/);
   assert.equal(f.commands.length, 0);
   f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_DEFAULT_BYTES });
@@ -388,6 +574,17 @@ test('the real process runner never returns raw account or token text on CLI fai
       return true;
     }
   );
+});
+
+test('the real process runner decodes UTF-8 characters split across output chunks', async () => {
+  const text = 'é'.repeat(70000) + '日本語🙂';
+  // Write the bytes in two pieces, cutting through the middle of a two-byte character.
+  const output = await runWarehouseCommand(process.execPath, [
+    '-e',
+    `const b = Buffer.from(${JSON.stringify(text)}); process.stdout.write(b.subarray(0, 70001), () => setTimeout(() => process.stdout.write(b.subarray(70001)), 20));`,
+  ]);
+  assert.equal(output, text);
+  assert.doesNotMatch(output, /\uFFFD/);
 });
 
 test('CLI failures provide specific actions for account, IAM, network, executable and query failures', () => {

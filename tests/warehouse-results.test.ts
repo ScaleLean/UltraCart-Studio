@@ -154,28 +154,34 @@ test('charts use actual pairs, reject implicit grouping, and preserve missing-va
   assert.equal(capped.truncated, 6);
 });
 
-test('CSV protects spreadsheet formulas in headers and text while preserving numbers, quotes, and newlines', () => {
+test('CSV protects spreadsheet formulas in headers and text while preserving bq numbers, quotes, and newlines', () => {
+  // bq returns every value, including numbers, as a JSON string.
   const csv = warehouseResultsCsv([
     {
       '=header': '=HYPERLINK("https://example.invalid")',
       text: 'first,"quoted"\nsecond',
-      number: -2.5,
+      number: '-2.5',
       optional: null,
     },
-    { '=header': '\t +cmd', text: '@SUM(A1:A2)', number: 0, optional: { flag: true } },
-    { '=header': '  \r\n=cmd', text: '＝SUM(A1:A2)', number: 4, optional: '' },
+    { '=header': '\t +cmd', text: '@SUM(A1:A2)', number: '0', optional: { flag: true } },
+    { '=header': '  \r\n=cmd', text: '＝SUM(A1:A2)', number: '-1.5E-7', optional: '' },
   ]);
   assert.equal(
     csv,
     '"\'=header","text","number","optional"\r\n' +
       '"\'=HYPERLINK(""https://example.invalid"")","first,""quoted""\nsecond","-2.5",""\r\n' +
       '"\'\t +cmd","\'@SUM(A1:A2)","0","{""flag"":true}"\r\n' +
-      '"\'  \r\n=cmd","\'＝SUM(A1:A2)","4",""'
+      '"\'  \r\n=cmd","\'＝SUM(A1:A2)","-1.5E-7",""'
   );
   assert.equal(warehouseResultsCsv([], ['label', 'value']), '"label","value"');
   assert.equal(
-    warehouseResultsCsv([{ a: '-10', b: '+10', c: 'safe' }]),
-    '"a","b","c"\r\n"\'-10","\'+10","safe"'
+    warehouseResultsCsv([{ a: '-10', b: '-12.5', c: '-.5', d: '12', e: 'safe' }]),
+    '"a","b","c","d","e"\r\n"-10","-12.5","-.5","12","safe"'
+  );
+  // Anything that is not a plain number keeps the formula guard.
+  assert.equal(
+    warehouseResultsCsv([{ a: '+10', b: '-10+1', c: '-1,5', d: ' -10', e: '-A1', f: '-', g: '-1e' }]),
+    '"a","b","c","d","e","f","g"\r\n"\'+10","\'-10+1","\'-1,5","\' -10","\'-A1","\'-","\'-1e"'
   );
 });
 

@@ -9,6 +9,7 @@ import { isSampleSelection } from '../shared/sample';
 import {
   WAREHOUSE_DEFAULT_BYTES,
   WAREHOUSE_MAX_BYTES,
+  WAREHOUSE_MIN_BYTES,
   warehouseDemoQueries,
   type WarehouseConfig,
   type WarehouseDiagnostics,
@@ -36,14 +37,19 @@ import {
 export type { WarehouseRunner } from './warehouse-diagnostics';
 
 const scopeInput = z.object({ workspaceId: z.string().min(1).max(100) });
+const byteCeiling = z
+  .number()
+  .int()
+  .min(WAREHOUSE_MIN_BYTES, 'BigQuery bills at least 10 MiB per query. Use a byte ceiling of 10 MiB or more.')
+  .max(WAREHOUSE_MAX_BYTES);
 const queryInput = z.object({
   sql: z.string().trim().min(1).max(20000),
   rowLimit: z.number().int().min(1).max(100),
-  maxBytes: z.number().int().min(1).max(WAREHOUSE_MAX_BYTES),
+  maxBytes: byteCeiling,
 });
 const tableName = z.string().regex(/^uc_[A-Za-z0-9_]{1,124}$/);
 const queryFunctions = new Set(
-  'ABS ACOS ANY_VALUE APPROX_COUNT_DISTINCT ARRAY ARRAY_AGG ARRAY_CONCAT ARRAY_LENGTH AVG CAST CEIL COALESCE CONCAT COUNT COUNTIF CURRENT_DATE CURRENT_DATETIME CURRENT_TIMESTAMP DATE DATE_ADD DATE_DIFF DATE_SUB DATE_TRUNC DATETIME DATETIME_DIFF DENSE_RANK ENDS_WITH EXTRACT FIRST_VALUE FLOOR FORMAT FORMAT_DATE FORMAT_TIMESTAMP GENERATE_ARRAY GENERATE_DATE_ARRAY GREATEST IF IFNULL JSON_EXTRACT JSON_EXTRACT_SCALAR JSON_QUERY JSON_VALUE LAG LAST_VALUE LEAD LEAST LENGTH LOWER MAX MIN MOD NULLIF OFFSET PARSE_DATE PARSE_TIMESTAMP PERCENTILE_CONT RANK REGEXP_CONTAINS REGEXP_EXTRACT REGEXP_REPLACE ROUND ROW_NUMBER SAFE_CAST SAFE_DIVIDE SAFE_MULTIPLY SAFE_OFFSET SAFE_SUBTRACT SPLIT SQRT STARTS_WITH STRING STRING_AGG STRUCT SUBSTR SUBSTRING SUM TIMESTAMP TIMESTAMP_ADD TIMESTAMP_DIFF TIMESTAMP_SECONDS TIMESTAMP_SUB TIMESTAMP_TRUNC TO_JSON_STRING TRIM UNNEST UPPER'.split(
+  'ABS ACOS ANY_VALUE APPROX_COUNT_DISTINCT ARRAY ARRAY_AGG ARRAY_CONCAT ARRAY_LENGTH AVG CAST CEIL COALESCE CONCAT COUNT COUNTIF CURRENT_DATE CURRENT_DATETIME CURRENT_TIMESTAMP DATE DATE_ADD DATE_DIFF DATE_SUB DATE_TRUNC DATETIME DATETIME_DIFF DENSE_RANK ENDS_WITH EXTRACT FIRST_VALUE FLOOR FORMAT FORMAT_DATE FORMAT_TIMESTAMP GENERATE_ARRAY GENERATE_DATE_ARRAY GREATEST IF IFNULL JSON_EXTRACT JSON_EXTRACT_SCALAR JSON_QUERY JSON_VALUE LAG LAST_VALUE LEAD LEAST LENGTH LOWER MAX MIN MOD NULLIF OFFSET PARSE_DATE PARSE_TIMESTAMP PERCENTILE_CONT RANK REGEXP_CONTAINS REGEXP_EXTRACT REGEXP_REPLACE REPLACE ROUND ROW_NUMBER SAFE_CAST SAFE_DIVIDE SAFE_MULTIPLY SAFE_OFFSET SAFE_SUBTRACT SPLIT SQRT STARTS_WITH STRING STRING_AGG STRUCT SUBSTR SUBSTRING SUM TIMESTAMP TIMESTAMP_ADD TIMESTAMP_DIFF TIMESTAMP_SECONDS TIMESTAMP_SUB TIMESTAMP_TRUNC TO_JSON_STRING TRIM UNNEST UPPER'.split(
     ' '
   )
 );
@@ -54,6 +60,7 @@ const syntaxCalls = new Set([
   'OVER',
   'SELECT',
   'FROM',
+  'JOIN',
   'WHERE',
   'AND',
   'OR',
@@ -64,11 +71,19 @@ const syntaxCalls = new Set([
   'ON',
   'BY',
 ]);
+// Function names that read outside the warehouse. They are never valid, in any position.
+const forbiddenAnywhere = new Set(['EXTERNAL_QUERY', 'EXTERNAL_OBJECT_TRANSFORM']);
+// Statement keywords. They are rejected only where a statement could start, so columns named
+// model, set or load and functions such as REPLACE stay usable. The dry run's statementType check
+// remains the backstop.
 const forbidden = new Set(
-  'ALTER ASSERT BEGIN CALL COMMIT CREATE DECLARE DELETE DROP EXECUTE EXPORT GRANT IMPORT INSERT LOAD MERGE REPLACE REVOKE ROLLBACK SET TRUNCATE UPDATE EXTERNAL_QUERY EXTERNAL_OBJECT_TRANSFORM REMOTE MODEL'.split(
+  'ALTER ASSERT BEGIN BREAK CALL COMMIT CONTINUE CREATE DECLARE DELETE DROP EXECUTE EXPORT FOR GRANT IMPORT INSERT ITERATE LEAVE LOAD LOOP MERGE MODEL RAISE REMOTE REPEAT RETURN REVOKE ROLLBACK SET TRUNCATE UPDATE WHILE'.split(
     ' '
   )
 );
+// Words that can follow a column name, so `(set IS NULL)` is an expression rather than a statement.
+const operatorWords = new Set(['AS', 'AND', 'BETWEEN', 'IN', 'IS', 'LIKE', 'NOT', 'OR']);
+const setOperators = new Set(['UNION', 'INTERSECT', 'EXCEPT']);
 type Token = { value: string; kind: 'word' | 'quoted' | 'string' | 'symbol' };
 function tokens(sql: string): Token[] {
   const result: Token[] = [];
@@ -131,6 +146,10 @@ export function warehouseProject(merchant: string) {
   const id = merchant.toLowerCase();
   return id.startsWith('ultracart-dw-') ? id : `ultracart-dw-${id}`;
 }
+const tableScopeError =
+  'Queries can name only this merchant’s ultracart_dw.uc_* views. Use the schema explorer to choose a table.';
+const curatedTable = /^uc_[A-Za-z0-9_]{1,124}$/;
+const isName = (token: Token | undefined) => token?.kind === 'word' || token?.kind === 'quoted';
 export function validateWarehouseSql(sql: string, project: string) {
   const parsed = tokens(sql.trim());
   if (!['SELECT', 'WITH'].includes(parsed[0]?.value.toUpperCase()))
@@ -144,41 +163,78 @@ export function validateWarehouseSql(sql: string, project: string) {
     )
       ctes.add(parsed[i].value.toLowerCase());
   }
+  /** A dotted name, with backtick-quoted segments split on their dots, as BigQuery resolves table paths. */
+  const pathAt = (start: number) => {
+    const parts: string[] = [];
+    let quoted = false;
+    let end = start;
+    for (;;) {
+      quoted ||= parsed[end].kind === 'quoted';
+      parts.push(...parsed[end].value.split('.'));
+      if (parsed[end + 1]?.value !== '.' || !isName(parsed[end + 2])) break;
+      end += 2;
+    }
+    return { parts, quoted };
+  };
+  const allowedTable = (parts: string[]) =>
+    (parts.length === 2
+      ? parts[0] === 'ultracart_dw'
+      : parts.length === 3 && parts[0] === project && parts[1] === 'ultracart_dw') &&
+    curatedTable.test(parts.at(-1)!);
   const refs = new Set<string>();
-  const fromAt = new Map<number, boolean>();
-  const functionAt = new Map<number, string>();
-  let depth = 0;
+  /** Opening parentheses that start a FROM item: a parenthesized join or a subquery. */
+  const sourceParens = new Set<number>();
+  // Deny by default: a FROM item must be a CTE, UNNEST, a parenthesized item, or an allowed table.
   const source = (start: number) => {
     const first = parsed[start];
     if (!first) throw new Error('Choose a curated table after FROM or JOIN.');
-    if (first.value === '(' || first.value.toUpperCase() === 'UNNEST') return;
-    if (!['word', 'quoted'].includes(first.kind)) throw new Error('Use an exact curated table name.');
-    let path = first.value;
-    let j = start;
-    while (parsed[j + 1]?.value === '.' && ['word', 'quoted'].includes(parsed[j + 2]?.kind)) {
-      path += '.' + parsed[j + 2].value;
-      j += 2;
+    if (first.value === '(') {
+      sourceParens.add(start);
+      return;
     }
-    const parts = path.split('.');
-    if (parts.length === 1 && ctes.has(parts[0].toLowerCase())) return;
-    const own =
-      parts.length === 2
-        ? parts[0] === 'ultracart_dw'
-        : parts.length === 3 && parts[0] === project && parts[1] === 'ultracart_dw';
-    const name = parts.at(-1)!;
-    if (!own || !/^uc_[A-Za-z0-9_]{1,124}$/.test(name))
-      throw new Error(
-        'Queries can name only this merchant’s ultracart_dw.uc_* views. Use the schema explorer to choose a table.'
-      );
-    refs.add(`${project}.ultracart_dw.${name}`);
+    if (first.kind === 'word' && first.value.toUpperCase() === 'UNNEST' && parsed[start + 1]?.value === '(')
+      return;
+    if (!isName(first)) throw new Error('Use an exact curated table name.');
+    const { parts } = pathAt(start);
+    if (parts.length === 1 && first.kind === 'word' && ctes.has(parts[0].toLowerCase())) return;
+    if (!allowedTable(parts)) throw new Error(tableScopeError);
+    refs.add(`${project}.ultracart_dw.${parts.at(-1)}`);
+  };
+  // Outside FROM items a dotted name is a column path. Reject any that could only name a table.
+  const expression = (start: number) => {
+    const { parts, quoted } = pathAt(start);
+    const tableLike =
+      parts.some((part) => part === '' || part.includes('-') || part.toUpperCase() === 'INFORMATION_SCHEMA') ||
+      (parts.length > 1 &&
+        (quoted || parts[0] === project || parts[0].toLowerCase().startsWith('ultracart_dw')));
+    if (tableLike && !allowedTable(parts)) throw new Error(tableScopeError);
+  };
+  const frames: { from: boolean; fn?: string; cte?: boolean }[] = [{ from: false }];
+  /** The token after a top-level CTE body, where the main statement starts. */
+  let statementAfterCte = -1;
+  const statementPosition = (i: number) => {
+    const before = parsed[i - 1]?.value.toUpperCase();
+    if (i === 0 || i === statementAfterCte) return true;
+    if (before && setOperators.has(before)) return true;
+    if ((before === 'ALL' || before === 'DISTINCT') && setOperators.has(parsed[i - 2]?.value.toUpperCase()))
+      return true;
+    if (before !== '(') return false;
+    // Inside parentheses, a keyword followed by a name or nothing starts a statement, e.g. `(DELETE FROM`.
+    const after = parsed[i + 1];
+    return !after || (isName(after) && !operatorWords.has(after.value.toUpperCase()));
   };
   for (let i = 0; i < parsed.length; i++) {
     const token = parsed[i];
     const upper = token.value.toUpperCase();
+    const frame = frames.at(-1)!;
     if (token.kind === 'string') continue;
-    if (token.kind === 'word' && forbidden.has(upper))
+    if (isName(token) && parsed[i - 1]?.value !== '.') expression(i);
+    if (
+      token.kind === 'word' &&
+      (forbiddenAnywhere.has(upper) || (forbidden.has(upper) && statementPosition(i)))
+    )
       throw new Error(`The ${upper} operation is not supported in read-only queries.`);
-    if (parsed[i + 1]?.value === '(' && ['word', 'quoted'].includes(token.kind)) {
+    if (parsed[i + 1]?.value === '(' && isName(token)) {
       if (
         token.kind === 'quoted' ||
         parsed[i - 1]?.value === '.' ||
@@ -187,18 +243,24 @@ export function validateWarehouseSql(sql: string, project: string) {
         throw new Error(`The function ${token.value} is outside the supported read-only SQL subset.`);
     }
     if (token.value === '(') {
-      depth++;
-      fromAt.set(depth, false);
-      if (parsed[i - 1]?.kind === 'word') functionAt.set(depth, parsed[i - 1].value.toUpperCase());
+      const opensSource = sourceParens.has(i);
+      frames.push({
+        from: opensSource,
+        fn: parsed[i - 1]?.kind === 'word' ? parsed[i - 1].value.toUpperCase() : undefined,
+        cte: frames.length === 1 && parsed[i - 1]?.value.toUpperCase() === 'AS',
+      });
+      // The first item of a parenthesized join is a FROM item too.
+      if (opensSource && !['SELECT', 'WITH'].includes(parsed[i + 1]?.value.toUpperCase() ?? ''))
+        source(i + 1);
     } else if (token.value === ')') {
-      fromAt.delete(depth);
-      functionAt.delete(depth);
-      depth--;
-      if (depth < 0) throw new Error('The query has an unmatched parenthesis.');
+      if (frames.pop()!.cte) statementAfterCte = i + 1;
+      if (frames.length === 0) throw new Error('The query has an unmatched parenthesis.');
     } else if (token.kind === 'word' && (upper === 'FROM' || upper === 'JOIN')) {
-      if (upper === 'FROM' && functionAt.get(depth) === 'EXTRACT') continue;
-      fromAt.set(depth, true);
+      if (upper === 'FROM' && frame.fn === 'EXTRACT') continue;
+      frame.from = true;
       source(i + 1);
+    } else if (token.kind === 'word' && upper === 'SELECT') {
+      frame.from = false;
     } else if (
       token.kind === 'word' &&
       [
@@ -214,10 +276,10 @@ export function validateWarehouseSql(sql: string, project: string) {
         'WINDOW',
       ].includes(upper)
     )
-      fromAt.set(depth, false);
-    else if (token.value === ',' && fromAt.get(depth)) source(i + 1);
+      frame.from = false;
+    else if (token.value === ',' && frame.from) source(i + 1);
   }
-  if (depth !== 0) throw new Error('The query has an unmatched parenthesis.');
+  if (frames.length !== 1) throw new Error('The query has an unmatched parenthesis.');
   return [...refs];
 }
 export function boundedWarehouseSql(query: WarehouseQuery, project: string) {
@@ -250,13 +312,19 @@ export function parseWarehouseDryRun(text: string, project: string, maxBytes: nu
   const references = stats.referencedTables ?? [];
   if (!Array.isArray(references) || references.length > 1000)
     throw new Error('BigQuery returned an invalid table receipt.');
+  // A query that names no curated view must not read any table. If it does, the SQL check missed a reference.
+  if (!needsTables && references.length > 0)
+    throw new Error('BigQuery reported tables this query does not name. No query was executed.');
   const referencedTables = references.map((ref: any) => {
-    if (
-      ref?.projectId !== project ||
-      !['ultracart_dw', 'ultracart_dw_streaming'].includes(ref?.datasetId) ||
-      typeof ref?.tableId !== 'string' ||
-      !/^[A-Za-z0-9_]{1,1024}$/.test(ref.tableId)
-    )
+    const tableId = typeof ref?.tableId === 'string' ? ref.tableId : '';
+    // Curated ultracart_dw.uc_* views read base tables in ultracart_dw_streaming, and BigQuery reports those
+    // base tables as referenced. They are accepted here only as view sources: validateWarehouseSql never lets
+    // SQL name ultracart_dw_streaming (or any non-uc_* table) directly.
+    const permitted =
+      ref?.projectId === project &&
+      ((ref?.datasetId === 'ultracart_dw' && curatedTable.test(tableId)) ||
+        (ref?.datasetId === 'ultracart_dw_streaming' && /^[A-Za-z0-9_]{1,1024}$/.test(tableId)));
+    if (!permitted)
       throw new Error('This query resolves outside the selected merchant’s permitted warehouse datasets.');
     return `${ref.projectId}.${ref.datasetId}.${ref.tableId}`;
   });
@@ -432,7 +500,7 @@ export class WarehouseService {
             (value) => isAbsolute(value) && warehouseAbsolutePath(value),
             'Use an absolute path to bq on this computer.'
           ),
-        maxBytes: z.number().int().min(1).max(WAREHOUSE_MAX_BYTES),
+        maxBytes: byteCeiling,
       })
       .strict()
       .parse(input);

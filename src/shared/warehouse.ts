@@ -1,5 +1,7 @@
 export const WAREHOUSE_MAX_BYTES = 20 * 1024 ** 3;
 export const WAREHOUSE_DEFAULT_BYTES = 1024 ** 3;
+/** BigQuery bills at least 10 MiB per query, so a lower ceiling would pass the dry run and always fail. */
+export const WAREHOUSE_MIN_BYTES = 10 * 1024 ** 2;
 export type WarehouseQuery = { sql: string; rowLimit: number; maxBytes: number };
 export type WarehouseConfig = { bqPath: string; maxBytes: number };
 export type WarehouseIssueCode =
