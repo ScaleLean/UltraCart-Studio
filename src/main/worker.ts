@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { version } from '../../package.json';
 import { Store } from './database';
 import { StudioServices } from './services';
+import { ConnectionService } from './domain/connection-service';
 import { Auth, LocalCredentials } from './auth';
 import { Agents } from './agent';
 import { PageBuilderService } from './page-builder';
@@ -30,6 +31,7 @@ function host(method: string, params: unknown): Promise<any> {
     port.postMessage({ host: true, id, method, params });
   });
 }
+ConnectionService.childObserver = (pid, state) => port.postMessage({ child: { pid, state } });
 const pathSchema = z.object({ path: z.string().min(1).max(2048), slot: draftScopeSchema.shape.slot });
 const inputScope = (input: unknown) => {
   const v = pathSchema.parse(input);

@@ -120,7 +120,11 @@ export function safeFailure(text: string) {
   return 'The toolkit could not complete the request. Check the selected profile, network, and installed toolkit, then retry.';
 }
 
+export type ChildObserver = (pid: number, state: 'started' | 'exited') => void;
+
 export class ConnectionService {
+  /** Lets the worker report toolkit child pids so the main process can kill them if the worker dies. */
+  static childObserver: ChildObserver | null = null;
   private children = new Set<ChildProcessWithoutNullStreams>();
   private login: Login | null = null;
   private loginChild: ChildProcessWithoutNullStreams | null = null;
@@ -197,7 +201,7 @@ export class ConnectionService {
           ...invocation.options,
           detached: process.platform !== 'win32',
         });
-        this.children.add(child);
+        this.track(child);
         let stdout = '',
           stderr = '',
           finished = false;
@@ -205,7 +209,7 @@ export class ConnectionService {
           if (finished) return;
           finished = true;
           clearTimeout(timer);
-          this.children.delete(child);
+          this.untrack(child);
           if (error) reject(error);
           else resolve(stdout.trim());
         };
@@ -352,14 +356,14 @@ export class ConnectionService {
       if (this.disposed || this.login.phase !== 'starting') throw new Error('Sign-in cancelled.');
       const child = spawn(invocation.command, invocation.args, invocation.options);
       this.loginChild = child;
-      this.children.add(child);
+      this.track(child);
       child.stdin.end();
       let stderr = '',
         stdout = '';
       const finish = (phase: Login['phase'], message: string) => {
         if (this.loginTimer) clearTimeout(this.loginTimer);
         this.loginTimer = null;
-        this.children.delete(child);
+        this.untrack(child);
         if (this.loginChild === child) this.loginChild = null;
         if (this.login?.id === id && ['starting', 'waiting'].includes(this.login.phase))
           this.login = { id, profile, phase, message, url: null, code: null };
@@ -441,10 +445,23 @@ export class ConnectionService {
   dispose() {
     this.disposed = true;
     if (this.loginTimer) clearTimeout(this.loginTimer);
-    for (const child of this.children) this.stopChild(child);
-    this.children.clear();
+    for (const child of this.children) {
+      this.stopChild(child);
+      this.untrack(child);
+    }
     this.login = null;
     this.loginChild = null;
+  }
+  private track(child: ChildProcessWithoutNullStreams) {
+    this.children.add(child);
+    if (child.pid) ConnectionService.childObserver?.(child.pid, 'started');
+    // The pid stays reported until the process has really exited, even after we stop waiting for it.
+    child.once('exit', () => {
+      if (child.pid) ConnectionService.childObserver?.(child.pid, 'exited');
+    });
+  }
+  private untrack(child: ChildProcessWithoutNullStreams) {
+    this.children.delete(child);
   }
   private stopChild(child: ChildProcessWithoutNullStreams) {
     if (process.platform !== 'win32' && child !== this.loginChild && child.pid) {

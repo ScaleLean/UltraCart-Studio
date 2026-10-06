@@ -13,6 +13,7 @@ import {
 } from 'electron';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync, cpSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Settings, StudioEvent } from '../shared/types';
@@ -33,6 +34,11 @@ let worker: UtilityProcess | null = null;
 let ready: Promise<unknown>;
 let quitting = false;
 let restarts = 0;
+// Toolkit child processes (reported by the worker) that must not outlive it.
+const toolkitPids = new Set<number>();
+const PREVIEW_PARTITION = 'studio-preview';
+let previewSessionConfigured = false;
+let previewCleared: Promise<unknown> = Promise.resolve();
 let preview: WebContentsView | null = null;
 let previewGeneration = 0;
 const pending = new Map<
@@ -77,6 +83,35 @@ function call(method: string, params?: unknown): Promise<any> {
     worker!.postMessage({ id, method, params });
   });
 }
+function killToolkitChildren() {
+  for (const pid of toolkitPids) {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+        .on('error', () => undefined)
+        .unref();
+      continue;
+    }
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* Already exited. */
+      }
+    }
+  }
+  toolkitPids.clear();
+}
+// Ask the worker to close its children and database, then kill it if it does not finish in time.
+async function stopWorker() {
+  const current = worker;
+  if (!current) return;
+  await Promise.race([call('shutdown'), new Promise((resolve) => setTimeout(resolve, 3000))]).catch(
+    () => undefined
+  );
+  current.kill();
+}
 function launchWorker() {
   worker = utilityProcess.fork(join(__dirname, 'worker.mjs'), [], {
     serviceName: 'UltraCart Studio Engine',
@@ -85,6 +120,11 @@ function launchWorker() {
   worker.on('message', async (data) => {
     if (data.event) {
       send(data.event);
+      return;
+    }
+    if (data.child) {
+      if (data.child.state === 'started') toolkitPids.add(data.child.pid);
+      else toolkitPids.delete(data.child.pid);
       return;
     }
     if (data.host) {
@@ -119,6 +159,7 @@ function launchWorker() {
   });
   worker.on('exit', () => {
     worker = null;
+    killToolkitChildren();
     for (const p of pending.values()) {
       clearTimeout(p.timeout);
       p.reject(new Error('The engine restarted. Saved work will reopen.'));
@@ -134,6 +175,8 @@ function launchWorker() {
   worker.stdout?.resume();
   worker.stderr?.resume();
   ready = call('init', { directory, root, credentials: loadCredentials() }).then(() => {
+    // A healthy start earns a fresh restart budget; only rapid repeated failures exhaust it.
+    restarts = 0;
     send({ type: 'worker', status: 'ready' });
   });
   ready.catch(() =>
@@ -211,11 +254,17 @@ function closePreview() {
     win.contentView.removeChildView(preview);
     preview.webContents.close();
     preview = null;
+    const ses = electronSession.fromPartition(PREVIEW_PARTITION);
+    previewCleared = Promise.all([ses.clearStorageData(), ses.clearCache(), ses.clearAuthCache()]).catch(
+      () => undefined
+    );
   }
 }
 async function openPreview(params: any) {
   closePreview();
   const generation = previewGeneration;
+  await previewCleared;
+  if (generation !== previewGeneration) return { opened: false };
   const source = await call('preview.prepare', params);
   if (generation !== previewGeneration) return { opened: false };
   const context = {
@@ -224,12 +273,14 @@ async function openPreview(params: any) {
     revision: source.revision,
     expectedPath: params.path,
   };
-  // Each preview gets its own ephemeral cookie jar. Preview credentials never reach the renderer.
-  const previewPartition = `studio-preview-${randomUUID()}`;
-  const ses = electronSession.fromPartition(previewPartition);
-  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-  ses.setPermissionCheckHandler(() => false);
-  ses.on('will-download', (event) => event.preventDefault());
+  // One in-memory partition is reused and cleared on close. Preview credentials never reach the renderer.
+  const ses = electronSession.fromPartition(PREVIEW_PARTITION);
+  if (!previewSessionConfigured) {
+    previewSessionConfigured = true;
+    ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+    ses.setPermissionCheckHandler(() => false);
+    ses.on('will-download', (event) => event.preventDefault());
+  }
   ses.webRequest.onHeadersReceived((details, callback) => {
     const header = Object.entries(details.responseHeaders || {})
       .find(([key]) => key.toLowerCase() === 'x-ultracart-preview')?.[1]
@@ -258,7 +309,7 @@ async function openPreview(params: any) {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
-      partition: previewPartition,
+      partition: PREVIEW_PARTITION,
     },
   });
   win.contentView.addChildView(preview);
@@ -404,7 +455,7 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
   }
   if (method === 'app.restartEngine') {
     restarts = 0;
-    worker?.kill();
+    await stopWorker();
     return true;
   }
   throw new Error('Unknown Studio operation.');
@@ -536,11 +587,10 @@ app.on('before-quit', (event) => {
     closePreview();
     if (!worker) return;
     event.preventDefault();
-    void Promise.race([call('shutdown'), new Promise((resolve) => setTimeout(resolve, 3000))])
-      .catch(() => undefined)
-      .finally(() => {
-        worker?.kill();
-        app.quit();
-      });
+    void stopWorker().finally(() => {
+      worker?.kill();
+      killToolkitChildren();
+      app.quit();
+    });
   }
 });
