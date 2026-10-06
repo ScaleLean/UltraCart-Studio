@@ -134,8 +134,6 @@ export class StudioServices {
   saveSettings(input: unknown) {
     const parsed = z
       .object({
-        nodePath: z.string().max(4096).refine(isAbsolute),
-        cliPath: z.string().max(4096).refine(isAbsolute),
         provider: z.enum(['openai', 'openai-codex']),
         model: z.string().min(1).max(150),
         reasoning: z.enum(['low', 'medium', 'high']),
@@ -143,9 +141,12 @@ export class StudioServices {
       })
       .strict()
       .parse(input);
-    this.store.set('settings', parsed);
+    // Paths are only changed through savePath, so a save never overwrites a path picked meanwhile.
+    const { nodePath, cliPath } = this.settings();
+    const next = { ...parsed, nodePath, cliPath };
+    this.store.set('settings', next);
     this.emit();
-    return parsed;
+    return next;
   }
   /** Persists one executable path chosen through a native dialog in the main process. */
   savePath(kind: 'nodePath' | 'cliPath', path: string) {

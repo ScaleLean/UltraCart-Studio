@@ -1,3 +1,4 @@
+import { RestartBudget } from './restart-budget';
 import {
   app,
   BrowserWindow,
@@ -33,7 +34,7 @@ let win: BrowserWindow;
 let worker: UtilityProcess | null = null;
 let ready: Promise<unknown>;
 let quitting = false;
-let restarts = 0;
+const restarts = new RestartBudget(3, 5 * 60_000);
 // Toolkit child processes (reported by the worker) that must not outlive it.
 const toolkitPids = new Set<number>();
 const PREVIEW_PARTITION = 'studio-preview';
@@ -165,7 +166,7 @@ function launchWorker() {
       p.reject(new Error('The engine restarted. Saved work will reopen.'));
     }
     pending.clear();
-    if (!quitting && restarts++ < 3) {
+    if (!quitting && restarts.take()) {
       send({ type: 'worker', status: 'restarting' });
       setTimeout(launchWorker, 750);
     } else if (!quitting)
@@ -175,8 +176,6 @@ function launchWorker() {
   worker.stdout?.resume();
   worker.stderr?.resume();
   ready = call('init', { directory, root, credentials: loadCredentials() }).then(() => {
-    // A healthy start earns a fresh restart budget; only rapid repeated failures exhaust it.
-    restarts = 0;
     send({ type: 'worker', status: 'ready' });
   });
   ready.catch(() =>
@@ -388,7 +387,9 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
     const current: Settings = await call('settings.current');
     if (requested.nodePath !== current.nodePath || requested.cliPath !== current.cliPath)
       throw new Error('Choose the Node and toolkit paths with the Browse buttons.');
-    return call(method, params);
+    // Omit the path fields so the worker keeps the stored ones; a Browse pick that landed meanwhile survives.
+    const { nodePath: _node, cliPath: _cli, ...rest } = requested;
+    return call(method, rest);
   }
   if (publicMethods.has(method)) return call(method, params);
   if (method === 'preview.open') return openPreview(params);
@@ -454,7 +455,7 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
     return { saved: !result.canceled };
   }
   if (method === 'app.restartEngine') {
-    restarts = 0;
+    restarts.reset();
     await stopWorker();
     return true;
   }

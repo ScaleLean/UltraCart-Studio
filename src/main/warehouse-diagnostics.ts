@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
+import { ConnectionService } from './domain/connection-service';
 import type { WarehouseIssue, WarehouseIssueCode } from '../shared/warehouse';
 
 const documentation = {
@@ -366,9 +367,15 @@ export const runWarehouseCommand: WarehouseRunner = (command, args) =>
     const child = spawn(launch.command, launch.args, {
       shell: false,
       windowsHide: true,
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: launch.env,
     });
+    const pid = child.pid;
+    if (pid) {
+      ConnectionService.childObserver?.(pid, 'started');
+      child.once('exit', () => ConnectionService.childObserver?.(pid, 'exited'));
+    }
     let stdout = '',
       stderr = '',
       settled = false;
