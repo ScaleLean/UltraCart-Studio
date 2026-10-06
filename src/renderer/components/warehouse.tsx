@@ -31,7 +31,7 @@ import {
 import type { Bootstrap } from '../../shared/types';
 import {
   warehouseBytes,
-  warehouseAbsolutePath,
+  warehouseBqPath,
   WAREHOUSE_DEFAULT_BYTES,
   warehouseDemoQueries,
   type WarehouseHistory,
@@ -1438,17 +1438,31 @@ export function Warehouse({
           </div>
           <label className="wh-settings-label">
             BigQuery CLI executable
-            <Input
-              value={bqPath}
-              onChange={(event) => {
-                setBqPath(event.target.value);
-                setDiagnostics(null);
-              }}
-              placeholder="/absolute/path/to/bq"
-            />
+            <div className="flex gap-2">
+              <Input value={bqPath} readOnly placeholder="/absolute/path/to/bq" />
+              <Button
+                variant="outline"
+                disabled={!!busy || sample}
+                onClick={() =>
+                  void operate(
+                    'Choosing BigQuery CLI',
+                    () => request<{ changed: boolean; status: WarehouseStatus }>('pickBqPath'),
+                    (result) => {
+                      if (!result.changed) return;
+                      setStatus(result.status);
+                      setBqPath(result.status.config.bqPath);
+                      setPrepared(null);
+                      setDiagnostics(null);
+                    }
+                  )
+                }
+              >
+                Browse
+              </Button>
+            </div>
             <small>
-              Use the full path to bq, or bq.cmd on Windows. Studio includes common installation folders when
-              it starts the CLI. The checks below identify runtime, account, and access problems.
+              Choose bq, or bq.cmd on Windows. Studio saves the file you choose and includes common installation
+              folders when it starts the CLI. The checks below identify runtime, account, and access problems.
             </small>
           </label>
           <label className="wh-settings-label">
@@ -1485,11 +1499,11 @@ export function Warehouse({
           <div className="wh-connection-actions">
             <Button
               variant="outline"
-              disabled={!!busy || !warehouseAbsolutePath(bqPath.trim()) || sample}
+              disabled={!!busy || !warehouseBqPath(bqPath) || sample}
               onClick={() =>
                 void operate(
                   'Checking connection',
-                  () => request<WarehouseDiagnostics>('diagnose', { bqPath: bqPath.trim() }),
+                  () => request<WarehouseDiagnostics>('diagnose'),
                   setDiagnostics
                 )
               }
@@ -1502,11 +1516,11 @@ export function Warehouse({
               Run connection checks
             </Button>
             <Button
-              disabled={!!busy || !warehouseAbsolutePath(bqPath.trim())}
+              disabled={!!busy}
               onClick={() =>
                 void operate(
                   'Saving connection',
-                  () => request<WarehouseStatus>('configure', { bqPath, maxBytes: settingsCap }),
+                  () => request<WarehouseStatus>('configure', { maxBytes: settingsCap }),
                   (next) => {
                     setStatus(next);
                     setMaxBytes(Math.min(maxBytes, next.config.maxBytes));
@@ -1516,7 +1530,7 @@ export function Warehouse({
                 )
               }
             >
-              Save connection
+              Save scan limit
             </Button>
           </div>
         </DialogContent>

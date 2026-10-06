@@ -24,7 +24,7 @@ import {
   type WarehouseStatus,
   type WarehouseTable,
 } from '../shared/warehouse';
-import { warehouseAbsolutePath } from '../shared/warehouse';
+import { warehouseBqPath } from '../shared/warehouse';
 import {
   runWarehouseCommand,
   warehouseDefaultBq,
@@ -48,6 +48,8 @@ const queryInput = z.object({
   maxBytes: byteCeiling,
 });
 const tableName = z.string().regex(/^uc_[A-Za-z0-9_]{1,124}$/);
+const bqExecutable = (value: string) => isAbsolute(value) && warehouseBqPath(value);
+const bqPathChange = 'Choose the BigQuery CLI with the Browse button.';
 const queryFunctions = new Set(
   'ABS ACOS ANY_VALUE APPROX_COUNT_DISTINCT ARRAY ARRAY_AGG ARRAY_CONCAT ARRAY_LENGTH AVG CAST CEIL COALESCE CONCAT COUNT COUNTIF CURRENT_DATE CURRENT_DATETIME CURRENT_TIMESTAMP DATE DATE_ADD DATE_DIFF DATE_SUB DATE_TRUNC DATETIME DATETIME_DIFF DENSE_RANK ENDS_WITH EXTRACT FIRST_VALUE FLOOR FORMAT FORMAT_DATE FORMAT_TIMESTAMP GENERATE_ARRAY GENERATE_DATE_ARRAY GREATEST IF IFNULL JSON_EXTRACT JSON_EXTRACT_SCALAR JSON_QUERY JSON_VALUE LAG LAST_VALUE LEAD LEAST LENGTH LOWER MAX MIN MOD NULLIF OFFSET PARSE_DATE PARSE_TIMESTAMP PERCENTILE_CONT RANK REGEXP_CONTAINS REGEXP_EXTRACT REGEXP_REPLACE REPLACE ROUND ROW_NUMBER SAFE_CAST SAFE_DIVIDE SAFE_MULTIPLY SAFE_OFFSET SAFE_SUBTRACT SPLIT SQRT STARTS_WITH STRING STRING_AGG STRUCT SUBSTR SUBSTRING SUM TIMESTAMP TIMESTAMP_ADD TIMESTAMP_DIFF TIMESTAMP_SECONDS TIMESTAMP_SUB TIMESTAMP_TRUNC TO_JSON_STRING TRIM UNNEST UPPER'.split(
     ' '
@@ -154,14 +156,32 @@ export function validateWarehouseSql(sql: string, project: string) {
   const parsed = tokens(sql.trim());
   if (!['SELECT', 'WITH'].includes(parsed[0]?.value.toUpperCase()))
     throw new Error('Only read-only SELECT or WITH queries are supported.');
+  /** The index of the parenthesis that closes the one at `open`, or the end of the query. */
+  const closing = (open: number) => {
+    let depth = 0;
+    for (let i = open; i < parsed.length; i++) {
+      if (parsed[i].value === '(') depth++;
+      else if (parsed[i].value === ')' && --depth === 0) return i;
+    }
+    return parsed.length;
+  };
+  // CTE names come only from a WITH list: `WITH [RECURSIVE] name AS (...), name AS (...)`. Other
+  // `name AS (` forms, such as WINDOW definitions, never make a name usable as a FROM item.
   const ctes = new Set<string>();
-  for (let i = 0; i < parsed.length - 2; i++) {
-    if (
-      parsed[i].kind === 'word' &&
-      parsed[i + 1].value.toUpperCase() === 'AS' &&
-      parsed[i + 2].value === '('
-    )
-      ctes.add(parsed[i].value.toLowerCase());
+  for (let i = 0; i < parsed.length; i++) {
+    if (parsed[i].kind !== 'word' || parsed[i].value.toUpperCase() !== 'WITH') continue;
+    let j = parsed[i + 1]?.value.toUpperCase() === 'RECURSIVE' ? i + 2 : i + 1;
+    while (
+      isName(parsed[j]) &&
+      parsed[j + 1]?.kind === 'word' &&
+      parsed[j + 1].value.toUpperCase() === 'AS' &&
+      parsed[j + 2]?.value === '('
+    ) {
+      if (parsed[j].kind === 'word') ctes.add(parsed[j].value.toLowerCase());
+      j = closing(j + 2) + 1;
+      if (parsed[j]?.value !== ',') break;
+      j++;
+    }
   }
   /** A dotted name, with backtick-quoted segments split on their dots, as BigQuery resolves table paths. */
   const pathAt = (start: number) => {
@@ -174,7 +194,7 @@ export function validateWarehouseSql(sql: string, project: string) {
       if (parsed[end + 1]?.value !== '.' || !isName(parsed[end + 2])) break;
       end += 2;
     }
-    return { parts, quoted };
+    return { parts, quoted, end };
   };
   const allowedTable = (parts: string[]) =>
     (parts.length === 2
@@ -195,7 +215,12 @@ export function validateWarehouseSql(sql: string, project: string) {
     if (first.kind === 'word' && first.value.toUpperCase() === 'UNNEST' && parsed[start + 1]?.value === '(')
       return;
     if (!isName(first)) throw new Error('Use an exact curated table name.');
-    const { parts } = pathAt(start);
+    const { parts, end } = pathAt(start);
+    // BigQuery reads an unquoted `a-b-c.dataset.table` as one dashed project path, and `dataset.1table`
+    // as one path too. A name followed by a dash or a dot is never a CTE or a curated view, so the
+    // whole item is refused rather than matched on its first segment.
+    if (['-', '.'].includes(parsed[end + 1]?.value))
+      throw new Error('Quote dashed project names with backticks, or use ultracart_dw.uc_* view names.');
     if (parts.length === 1 && first.kind === 'word' && ctes.has(parts[0].toLowerCase())) return;
     if (!allowedTable(parts)) throw new Error(tableScopeError);
     refs.add(`${project}.ultracart_dw.${parts.at(-1)}`);
@@ -441,10 +466,22 @@ export class WarehouseService {
   }
   private config(workspace: Workspace): WarehouseConfig {
     const fallback = warehouseDefaultBq(this.exists);
-    return this.services.store.get(this.storeKey(workspace, 'config'), {
+    const config = this.services.store.get(this.storeKey(workspace, 'config'), {
       bqPath: fallback,
       maxBytes: WAREHOUSE_DEFAULT_BYTES,
     });
+    // A stored path that is not a bq launcher, for example one saved by an older version, is never run.
+    return bqExecutable(config.bqPath) ? config : { ...config, bqPath: fallback };
+  }
+  private saveConfig(workspace: Workspace, config: WarehouseConfig) {
+    this.services.store.set(this.storeKey(workspace, 'config'), config);
+    this.services.store.set(this.storeKey(workspace, 'checked'), null);
+    this.services.store.set(this.storeKey(workspace, 'issue'), null);
+    this.services.store.set(this.storeKey(workspace, 'diagnostics'), null);
+    for (const [id, ticket] of this.tickets)
+      if (ticket.merchant === this.merchant(workspace)) this.tickets.delete(id);
+    this.services.emit();
+    return this.status({ workspaceId: workspace.id });
   }
   private base(workspace: Workspace) {
     return [
@@ -489,30 +526,33 @@ export class WarehouseService {
       history: this.history({ workspaceId: workspace.id }),
     };
   }
+  /** Changes the scan ceiling. The renderer cannot change bqPath; it may only repeat the current value. */
   configure(input: unknown) {
+    const v = scopeInput
+      .extend({ bqPath: z.string().max(4096).optional(), maxBytes: byteCeiling })
+      .strict()
+      .parse(input);
+    const workspace = this.current(v.workspaceId);
+    const config = this.config(workspace);
+    if (v.bqPath !== undefined && v.bqPath !== config.bqPath) throw new Error(bqPathChange);
+    return this.saveConfig(workspace, { bqPath: config.bqPath, maxBytes: v.maxBytes });
+  }
+  /**
+   * Host-only: main calls this with the path a native file dialog returned. It is not in the public
+   * allowlist, so the renderer cannot choose the executable Studio runs.
+   */
+  setBqPath(input: unknown) {
     const v = scopeInput
       .extend({
         bqPath: z
           .string()
-          .trim()
           .max(4096)
-          .refine(
-            (value) => isAbsolute(value) && warehouseAbsolutePath(value),
-            'Use an absolute path to bq on this computer.'
-          ),
-        maxBytes: byteCeiling,
+          .refine(bqExecutable, 'Choose the BigQuery CLI executable: bq, or bq.cmd on Windows.'),
       })
       .strict()
       .parse(input);
     const workspace = this.current(v.workspaceId);
-    this.services.store.set(this.storeKey(workspace, 'config'), { bqPath: v.bqPath, maxBytes: v.maxBytes });
-    this.services.store.set(this.storeKey(workspace, 'checked'), null);
-    this.services.store.set(this.storeKey(workspace, 'issue'), null);
-    this.services.store.set(this.storeKey(workspace, 'diagnostics'), null);
-    for (const [id, ticket] of this.tickets)
-      if (ticket.merchant === this.merchant(workspace)) this.tickets.delete(id);
-    this.services.emit();
-    return this.status({ workspaceId: workspace.id });
+    return this.saveConfig(workspace, { bqPath: v.bqPath, maxBytes: this.config(workspace).maxBytes });
   }
   private async command(workspace: Workspace, args: string[]) {
     try {
@@ -530,22 +570,14 @@ export class WarehouseService {
   }
   async diagnose(input: unknown): Promise<WarehouseDiagnostics> {
     const v = scopeInput
-      .extend({
-        bqPath: z
-          .string()
-          .trim()
-          .max(4096)
-          .refine(
-            (value) => isAbsolute(value) && warehouseAbsolutePath(value),
-            'Use an absolute path to bq on this computer.'
-          )
-          .optional(),
-      })
+      .extend({ bqPath: z.string().max(4096).optional() })
       .strict()
       .parse(input);
     const workspace = this.current(v.workspaceId);
     const config = this.config(workspace);
-    const bqPath = v.bqPath ?? config.bqPath;
+    // Checks run only the saved executable, which main chose through a native dialog.
+    if (v.bqPath !== undefined && v.bqPath !== config.bqPath) throw new Error(bqPathChange);
+    const bqPath = config.bqPath;
     const project = warehouseProject(workspace.selection.merchantId);
     const gcloudPath = warehouseGcloudPath(bqPath, this.exists);
     const report: WarehouseDiagnostics = {
@@ -585,14 +617,12 @@ export class WarehouseService {
           label: 'Sign in only if the account check requires it',
           command: warehouseTerminalCommand(gcloudPath, ['auth', 'login']),
         });
-      if (bqPath === config.bqPath) {
-        this.services.store.set(this.storeKey(workspace, 'diagnostics'), report);
-        this.services.store.set(
-          this.storeKey(workspace, 'issue'),
-          report.checks.find((check) => check.state === 'failed')?.issue || null
-        );
-        this.services.emit();
-      }
+      this.services.store.set(this.storeKey(workspace, 'diagnostics'), report);
+      this.services.store.set(
+        this.storeKey(workspace, 'issue'),
+        report.checks.find((check) => check.state === 'failed')?.issue || null
+      );
+      this.services.emit();
       return report;
     };
     const failure = (error: unknown) =>

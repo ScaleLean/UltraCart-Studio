@@ -10,6 +10,7 @@ import {
 } from '../src/main/warehouse';
 import {
   warehouseAbsolutePath,
+  warehouseBqPath,
   warehouseDemoQueries,
   WAREHOUSE_DEFAULT_BYTES,
   WAREHOUSE_MIN_BYTES,
@@ -250,6 +251,86 @@ test('table references are deny-by-default against adversarial paths, qualifiers
     validateWarehouseSql(sql, project);
 });
 
+test('CTE names come only from WITH lists and never shadow dashed or dotted table paths', () => {
+  const project = 'ultracart-dw-demo';
+  const raw = 'ultracart-dw-demo.ultracart_dw_streaming.orders';
+  const rejected = {
+    'integration review reproductions': [
+      `WITH ultracart AS (SELECT 1) SELECT * FROM ultracart_dw.uc_orders o, ${raw}`,
+      `SELECT * FROM ultracart_dw.uc_orders o, ${raw} WINDOW ultracart AS (ORDER BY 1)`,
+    ],
+    'WINDOW names are not CTEs': [
+      'SELECT * FROM ultracart_dw.uc_a, w WINDOW w AS (ORDER BY 1)',
+      'SELECT * FROM ultracart_dw.uc_a, secret WINDOW secret AS (PARTITION BY id)',
+      'WITH x AS (SELECT 1) SELECT * FROM x, w WINDOW w AS (ORDER BY 1)',
+      `SELECT * FROM (SELECT 1 FROM ultracart_dw.uc_a WINDOW ultracart AS (ORDER BY 1)), ${raw}`,
+    ],
+    'CTE names equal to project or dataset prefixes': [
+      `WITH ultracart AS (SELECT 1) SELECT * FROM ${raw}`,
+      `WITH RECURSIVE ultracart AS (SELECT 1) SELECT * FROM ${raw}`,
+      `with recursive ultracart as (select 1) select * from ${raw}`,
+      `WITH a AS (SELECT 1), ultracart AS (SELECT 2) SELECT * FROM a, ${raw}`,
+      'WITH ultracart_dw_streaming AS (SELECT 1) SELECT * FROM ultracart_dw_streaming.orders',
+      'WITH ultracart_dw_streaming AS (SELECT 1) SELECT * FROM ultracart_dw_streaming.1orders',
+      'WITH ultracart AS (SELECT 1) SELECT * FROM ultracart.ultracart_dw_streaming.orders',
+      'WITH region AS (SELECT 1) SELECT * FROM region-us.INFORMATION_SCHEMA.JOBS',
+      'WITH secret AS (SELECT 1) SELECT * FROM secret.customers',
+      'WITH ultracart AS (SELECT 1) SELECT * FROM `ultracart`-dw-demo.ultracart_dw_streaming.orders',
+    ],
+    'aliases that shadow a dashed prefix': [
+      `SELECT * FROM ultracart_dw.uc_a AS ultracart, ${raw}`,
+      `SELECT * FROM ultracart_dw.uc_a ultracart JOIN ${raw} ON TRUE`,
+      `SELECT * FROM (SELECT 1) ultracart, ${raw}`,
+      `SELECT * FROM ultracart_dw.uc_a, UNNEST([1]) AS ultracart, ${raw}`,
+      `SELECT STRUCT(1 AS ultracart) FROM ultracart_dw.uc_a, ${raw}`,
+    ],
+    'dashed names after commas and in JOIN chains': [
+      `SELECT * FROM ultracart_dw.uc_a, ultracart_dw.uc_b, ${raw}`,
+      `SELECT * FROM ultracart_dw.uc_a JOIN ultracart_dw.uc_b ON TRUE LEFT JOIN ${raw} ON TRUE`,
+      `SELECT * FROM ultracart_dw.uc_a CROSS JOIN ${raw} CROSS JOIN ultracart_dw.uc_b`,
+      `WITH ultracart AS (SELECT 1) SELECT * FROM (ultracart_dw.uc_a CROSS JOIN ${raw})`,
+      `WITH ultracart AS (SELECT 1) SELECT * FROM (${raw} CROSS JOIN ultracart_dw.uc_a)`,
+      `SELECT * FROM ultracart_dw.uc_a-dw-demo.ultracart_dw_streaming.orders`,
+      `SELECT * FROM ultracart_dw.uc_a - dw`,
+      'SELECT * FROM ultracart-dw-demo.ultracart_dw.uc_orders',
+    ],
+    'subqueries, UNNEST and nested WITH': [
+      `WITH ultracart AS (SELECT 1) SELECT (SELECT COUNT(*) FROM ${raw}) FROM ultracart`,
+      `WITH ultracart AS (SELECT 1) SELECT * FROM ultracart WHERE EXISTS (SELECT 1 FROM ${raw})`,
+      `SELECT * FROM (WITH ultracart AS (SELECT 1) SELECT * FROM ${raw})`,
+      `WITH x AS (WITH ultracart AS (SELECT 1) SELECT * FROM ${raw}) SELECT * FROM x`,
+      `WITH ultracart AS (SELECT 1) SELECT * FROM ultracart_dw.uc_a, UNNEST(a.items), ${raw}`,
+      `WITH ultracart AS (SELECT 1) SELECT * FROM ultracart_dw.uc_a UNION ALL SELECT * FROM ${raw}`,
+      `SELECT * FROM ultracart_dw.uc_a x, UNNEST(x.items) WITH OFFSET AS ultracart, ${raw}`,
+    ],
+  };
+  for (const [group, list] of Object.entries(rejected))
+    for (const sql of list)
+      assert.throws(() => validateWarehouseSql(sql, project), /ultracart_dw\.uc_\*/, `${group}: ${sql}`);
+  for (const [sql, refs] of [
+    ['WITH ultracart AS (SELECT 1) SELECT * FROM ultracart', []],
+    ['WITH RECURSIVE r AS (SELECT 1 AS n) SELECT * FROM r', []],
+    [
+      'WITH a AS (SELECT * FROM ultracart_dw.uc_a), b AS (SELECT * FROM a) SELECT * FROM a, b',
+      ['ultracart-dw-demo.ultracart_dw.uc_a'],
+    ],
+    [
+      'SELECT id, SUM(total) OVER w FROM ultracart_dw.uc_orders WINDOW w AS (PARTITION BY id ORDER BY created)',
+      ['ultracart-dw-demo.ultracart_dw.uc_orders'],
+    ],
+    [
+      'WITH ultracart_dw AS (SELECT 1) SELECT * FROM ultracart_dw.uc_orders',
+      ['ultracart-dw-demo.ultracart_dw.uc_orders'],
+    ],
+    [
+      'SELECT * FROM `ultracart-dw-demo.ultracart_dw.uc_orders` o, UNNEST(o.items) WITH OFFSET AS pos',
+      ['ultracart-dw-demo.ultracart_dw.uc_orders'],
+    ],
+    ['SELECT total - 1 AS net FROM ultracart_dw.uc_orders', ['ultracart-dw-demo.ultracart_dw.uc_orders']],
+  ] as const)
+    assert.deepEqual(validateWarehouseSql(sql, project), refs, sql);
+});
+
 test('dry-run receipts accept curated uc_* views and their streaming sources only', () => {
   const project = 'ultracart-dw-demo';
   const tables = (...refs: [string, string][]) =>
@@ -322,12 +403,12 @@ test('statement keywords are rejected only at statement position, so valid SQL u
 test('byte ceilings below the 10 MiB BigQuery billing minimum are rejected', async () => {
   const f = fixture();
   for (const maxBytes of [1, 1000, WAREHOUSE_MIN_BYTES - 1]) {
-    assert.throws(() => f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes }), /10 MiB/);
+    assert.throws(() => f.warehouse.configure({ workspaceId: live.id, maxBytes }), /10 MiB/);
     await assert.rejects(f.warehouse.prepare({ workspaceId: live.id, ...query, maxBytes }), /10 MiB/);
     assert.throws(() => f.warehouse.save({ workspaceId: live.id, name: 'Low', ...query, maxBytes }), /10 MiB/);
   }
   assert.equal(f.commands.length, 0);
-  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_MIN_BYTES });
+  f.warehouse.configure({ workspaceId: live.id, maxBytes: WAREHOUSE_MIN_BYTES });
   const prepared = await f.warehouse.prepare({ workspaceId: live.id, ...query, maxBytes: WAREHOUSE_MIN_BYTES });
   assert.equal(prepared.receipt.maxBytes, WAREHOUSE_MIN_BYTES);
 });
@@ -418,7 +499,7 @@ test('warehouse tickets reject stale workspaces, changed identity, changed ceili
   f.setWorkspace({ ...live, selection: { ...live.selection, verifiedAt: '2026-02-01' } });
   await assert.rejects(f.warehouse.run({ workspaceId: live.id, ticket: prepared.ticket }), /new dry run/);
   f.setWorkspace(structuredClone(live));
-  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_DEFAULT_BYTES });
+  f.warehouse.configure({ workspaceId: live.id, maxBytes: WAREHOUSE_DEFAULT_BYTES });
   await assert.rejects(f.warehouse.run({ workspaceId: live.id, ticket: prepared.ticket }), /new dry run/);
   const expired = await f.warehouse.prepare({ workspaceId: live.id, ...query });
   f.advance(300001);
@@ -428,10 +509,10 @@ test('warehouse tickets reject stale workspaces, changed identity, changed ceili
 
 test('a fresh dry-run boundary failure or a lowered merchant ceiling blocks query execution', async () => {
   const f = fixture();
-  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_MIN_BYTES });
+  f.warehouse.configure({ workspaceId: live.id, maxBytes: WAREHOUSE_MIN_BYTES });
   await assert.rejects(f.warehouse.prepare({ workspaceId: live.id, ...query }), /merchant scan ceiling/);
   assert.equal(f.commands.length, 0);
-  f.warehouse.configure({ workspaceId: live.id, bqPath: '/bq', maxBytes: WAREHOUSE_DEFAULT_BYTES });
+  f.warehouse.configure({ workspaceId: live.id, maxBytes: WAREHOUSE_DEFAULT_BYTES });
   const prepared = await f.warehouse.prepare({ workspaceId: live.id, ...query });
   f.setResponse(async () =>
     dry({
@@ -774,13 +855,54 @@ test('sample diagnostics never start CLI processes and stale diagnostics cannot 
   f.setWorkspace(structuredClone(live));
   assert.equal(f.warehouse.status({ workspaceId: live.id }).diagnostics, null);
   f.setResponse(async (args) => {
-    f.warehouse.configure({
-      workspaceId: live.id,
-      bqPath: '/different/bq',
-      maxBytes: WAREHOUSE_DEFAULT_BYTES,
-    });
+    f.warehouse.setBqPath({ workspaceId: live.id, bqPath: '/different/bq' });
     return diagnosticResponse(args);
   });
   await assert.rejects(f.warehouse.diagnose({ workspaceId: live.id }), /settings changed/);
   assert.equal(f.warehouse.status({ workspaceId: live.id }).diagnostics, null);
+});
+
+test('the renderer cannot choose the bq executable; only a host-picked bq launcher is saved and run', async () => {
+  const f = fixture();
+  const initial = f.warehouse.status({ workspaceId: live.id }).config.bqPath;
+  for (const bqPath of ['/bin/sh', '/tmp/evil', '/different/bq'])
+    assert.throws(
+      () => f.warehouse.configure({ workspaceId: live.id, bqPath, maxBytes: WAREHOUSE_DEFAULT_BYTES }),
+      /Browse/,
+      bqPath
+    );
+  await assert.rejects(f.warehouse.diagnose({ workspaceId: live.id, bqPath: '/bin/sh' }), /Browse/);
+  assert.equal(f.commands.length, 0);
+  // Repeating the saved path is harmless, so ceiling changes still work.
+  f.warehouse.configure({ workspaceId: live.id, bqPath: initial, maxBytes: WAREHOUSE_MIN_BYTES });
+  assert.equal(f.warehouse.status({ workspaceId: live.id }).config.bqPath, initial);
+  for (const bqPath of [
+    '/bin/sh',
+    '/usr/bin/python3',
+    'relative/bq',
+    '/opt/bq/evil',
+    '/opt/sdk/bin/bqx',
+    '/opt/sdk/bin/bq.sh',
+    '/opt/sdk/bin/not-bq',
+    '/opt/sdk/bin/bq\n',
+  ])
+    assert.throws(() => f.warehouse.setBqPath({ workspaceId: live.id, bqPath }), /BigQuery CLI executable/, bqPath);
+  assert.equal(f.warehouse.status({ workspaceId: live.id }).config.bqPath, initial);
+  for (const bqPath of ['/opt/sdk/bin/bq', '/opt/sdk/bin/BQ', '/opt/sdk/bin/bq.CMD', '/opt/sdk/bin/Bq.exe']) {
+    const status = f.warehouse.setBqPath({ workspaceId: live.id, bqPath });
+    assert.equal(status.config.bqPath, bqPath);
+    assert.equal(status.config.maxBytes, WAREHOUSE_MIN_BYTES);
+  }
+  for (const bqPath of ['C:\\SDK\\bin\\bq.cmd', 'C:\\SDK\\bin\\BQ.EXE', '/usr/local/bin/bq'])
+    assert.equal(warehouseBqPath(bqPath), true, bqPath);
+  for (const bqPath of ['C:\\SDK\\bin\\bq.bat', 'bq', 'C:\\SDK\\bin\\gcloud.cmd'])
+    assert.equal(warehouseBqPath(bqPath), false, bqPath);
+  // A non-bq path stored by an older version falls back to the default launcher and is never run.
+  f.values.set([...f.values.keys()].find((key) => key.endsWith(':config'))!, {
+    bqPath: '/bin/sh',
+    maxBytes: WAREHOUSE_DEFAULT_BYTES,
+  });
+  assert.equal(f.warehouse.status({ workspaceId: live.id }).config.bqPath, initial);
+  await f.warehouse.diagnose({ workspaceId: live.id });
+  assert.ok(f.commands.every((command) => command.command !== '/bin/sh'));
 });

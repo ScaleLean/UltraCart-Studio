@@ -3,7 +3,7 @@ import { defineTool } from '@earendil-works/pi-durable';
 import type { Session } from '../shared/types';
 import type { BuilderNode, CjsonNode } from '../shared/page-builder';
 import { sameStore } from '../shared/storefront';
-import { WAREHOUSE_DEFAULT_BYTES, WAREHOUSE_MAX_BYTES } from '../shared/warehouse';
+import { WAREHOUSE_DEFAULT_BYTES, WAREHOUSE_MAX_BYTES, WAREHOUSE_MIN_BYTES } from '../shared/warehouse';
 import type { StudioServices } from './services';
 import type { PageBuilderService } from './page-builder';
 import type { LandingService } from './landing';
@@ -255,7 +255,7 @@ export function featureTools(
           name: Type.String({ minLength: 1, maxLength: 80 }),
           sql: Type.String({ minLength: 1, maxLength: 20000 }),
           rowLimit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-          maxBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: WAREHOUSE_MAX_BYTES })),
+          maxBytes: Type.Optional(Type.Integer({ minimum: WAREHOUSE_MIN_BYTES, maximum: WAREHOUSE_MAX_BYTES })),
         }),
         replay: 'unsafe',
         executionMode: 'sequential',
