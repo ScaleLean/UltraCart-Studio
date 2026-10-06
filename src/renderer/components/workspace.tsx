@@ -135,7 +135,9 @@ export function WorkspaceCanvas({
   const [rightVisible, setRightVisible] = useState(true);
   const [publishOpen, setPublishOpen] = useState(false);
   const [confirmation, setConfirmation] = useState('');
+  const [abandonOpen, setAbandonOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState(0);
   const [idsOpen, setIdsOpen] = useState(false);
   const [history, setHistory] = useState<{ revision: number; at: string; changedFields: number }[]>([]);
   const [templates, setTemplates] = useState<TemplateResult | null>(null);
@@ -145,7 +147,7 @@ export function WorkspaceCanvas({
   const change = data.changes.find((c) => c.scope.path === page.path && c.scope.slot === slot);
   const draft = change?.draft;
   const sample = data.workspace.kind === 'sample';
-  const isOverlay = overlayOpen || publishOpen || historyOpen || idsOpen || !!source;
+  const isOverlay = overlayOpen || publishOpen || abandonOpen || historyOpen || idsOpen || !!source;
   const currentPath = useRef(page.path);
   currentPath.current = page.path;
   useEffect(() => {
@@ -261,6 +263,7 @@ export function WorkspaceCanvas({
     if (!draft) return;
     try {
       setHistory(await invoke('draft.history', { path: page.path, slot, id: draft.id }));
+      setHistoryRevision(draft.revision);
       setHistoryOpen(true);
     } catch (error) {
       toast.error(errorText(error));
@@ -563,17 +566,31 @@ export function WorkspaceCanvas({
                     disabled={!!action}
                     onClick={() =>
                       run('verify', async () => {
-                        await invoke('draft.verify', {
+                        const result = await invoke<Change>('draft.verify', {
                           path: page.path,
                           slot,
                           id: draft.id,
                           revision: draft.revision,
                         });
-                        toast.success('Published content verified');
+                        if (result.publishedAt) toast.success('Published content verified');
+                        else toast.info('The live page is unchanged. You can publish again.');
                       })
                     }
                   >
                     Verify publish
+                  </Button>
+                )}
+                {change?.publishPending && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!!action}
+                    onClick={() => {
+                      setConfirmation('');
+                      setAbandonOpen(true);
+                    }}
+                  >
+                    Abandon attempt
                   </Button>
                 )}
                 {!sample && !!draft.localWidgetCount && (
@@ -842,6 +859,54 @@ export function WorkspaceCanvas({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <Dialog open={abandonOpen} onOpenChange={setAbandonOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Abandon this publish attempt</DialogTitle>
+            <DialogDescription>
+              The app rereads the live page at {page.path}. If it no longer matches this revision or its
+              baseline, the draft is replaced with the live content as a new revision. Revision{' '}
+              {draft?.revision} stays in history.
+            </DialogDescription>
+          </DialogHeader>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="abandon-confirm">
+                Type {data.workspace.selection.storefront.host} to confirm
+              </FieldLabel>
+              <Input
+                id="abandon-confirm"
+                value={confirmation}
+                onChange={(event) => setConfirmation(event.target.value)}
+              />
+            </Field>
+          </FieldGroup>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAbandonOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={confirmation !== data.workspace.selection.storefront.host || !!action}
+              onClick={() =>
+                run('abandon', async () => {
+                  await invoke('draft.abandon', {
+                    path: page.path,
+                    slot,
+                    id: draft!.id,
+                    revision: draft!.revision,
+                    confirmation,
+                  });
+                  toast.success('Publish attempt abandoned');
+                  setAbandonOpen(false);
+                })
+              }
+            >
+              {action === 'abandon' && <LoaderCircle className="spin" data-icon="inline-start" />}Abandon
+              attempt
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
         <DialogContent>
           <DialogHeader>
@@ -871,6 +936,7 @@ export function WorkspaceCanvas({
                         slot,
                         id: draft!.id,
                         revision: item.revision,
+                        expectedRevision: historyRevision,
                       });
                       setHistoryOpen(false);
                       toast.success('Restored as a new revision');

@@ -2,6 +2,7 @@ import type { DraftScope } from '../shared/drafts';
 import { parseContentMap, type ContentMap } from '../shared/content-map';
 import { isSampleSelection } from '../shared/sample';
 import type { ConnectionService } from './domain/connection-service';
+import { parseJson } from './domain/draft-service';
 
 export async function readContentMap(
   connection: Pick<ConnectionService, 'verify' | 'run'>,
@@ -46,7 +47,7 @@ export async function readContentMap(
     ],
     { acceptedExitCodes: [0, 1] }
   );
-  const result = parseContentMap(JSON.parse(raw), scope);
+  const result = parseContentMap(parseJson(raw, 'The toolkit returned an unreadable content map.'), scope);
   await connection.verify(scope.selection);
   return result;
 }

@@ -195,6 +195,7 @@ const publicMethods = new Set([
   'draft.restore',
   'draft.publish',
   'draft.verify',
+  'draft.abandon',
   'draft.next',
   'session.create',
   'session.view',

@@ -120,6 +120,13 @@ test('content discovery uses bounded read-only locate and verifies identity befo
     ),
     /identity changed/
   );
+  await assert.rejects(
+    readContentMap(
+      { verify: async () => scope.selection.storefront, run: async () => 'Error: timeout' },
+      scope
+    ),
+    /unreadable content map/
+  );
 });
 test('sample content map stays local', async () => {
   const fail = async (): Promise<never> => {

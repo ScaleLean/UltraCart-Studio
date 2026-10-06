@@ -208,8 +208,8 @@ async function dispatch(method: string, input: any) {
       return services.history(v.id);
     }
     case 'draft.restore': {
-      const v = draftSchema.parse(input);
-      return services.restore(services.scope(v.path, v.slot), v.id, v.revision);
+      const v = draftSchema.extend({ expectedRevision: z.number().int().positive() }).parse(input);
+      return services.restore(services.scope(v.path, v.slot), v.id, v.revision, v.expectedRevision);
     }
     case 'draft.export': {
       const v = draftSchema.parse(input);
@@ -222,6 +222,10 @@ async function dispatch(method: string, input: any) {
     case 'draft.verify': {
       const v = draftSchema.parse(input);
       return services.verifyPublish(services.scope(v.path, v.slot), v.id, v.revision);
+    }
+    case 'draft.abandon': {
+      const v = draftSchema.extend({ confirmation: z.string().max(253).optional() }).parse(input);
+      return services.abandonPublish(services.scope(v.path, v.slot), v.id, v.revision, v.confirmation);
     }
     case 'draft.next': {
       const v = draftSchema.parse(input);
