@@ -208,8 +208,9 @@ function view(record: Stored): Draft {
   };
 }
 export function parseDraftValidation(text: string): DraftReview['validation'] {
-  const data = JSON.parse(text);
+  const data = parseJson(text, 'The toolkit returned an invalid validation report.');
   if (
+    !data ||
     typeof data.valid !== 'boolean' ||
     !Number.isSafeInteger(data.errors) ||
     data.errors < 0 ||
@@ -274,7 +275,7 @@ export class DraftService {
       .prepare('SELECT record FROM storefront_drafts WHERE scope_key = ?')
       .get(scopeKey(scope)) as { record: string } | undefined;
     if (!row) return null;
-    const stored = JSON.parse(row.record) as Stored;
+    const stored = parseJson(row.record, 'The saved draft is unreadable.') as Stored;
     if (
       scopeKey(stored.scope) !== scopeKey(scope) ||
       stored.container !== containerPath(scope.path, scope.slot) ||
@@ -329,9 +330,10 @@ export class DraftService {
         throw new Error('This container exceeds the 512 KiB draft limit.');
       const baseline = await readFile(file, 'utf8');
       const baselineState = await readFile(file + '.sf.json', 'utf8');
-      const state = JSON.parse(baselineState);
+      const state = parseJson(baselineState, 'The toolkit returned an unreadable baseline.');
       const hash = draftHash(baseline);
       if (
+        !state ||
         state.version !== 1 ||
         state.merchant !== scope.selection.merchantId ||
         state.storefront !== scope.selection.storefront.id ||
@@ -454,7 +456,20 @@ export class DraftService {
         await writeFile(file, record.content, { mode: 0o600, flag: 'wx' });
         return parseDraftValidation(await this.toolkit.validateLocal(file));
       });
-      const localWidgetCount = view(record).localWidgetCount ?? 0;
+      let localWidgetCount = 0;
+      try {
+        localWidgetCount = inspectBuilderContent(record.content, record.baseline).localNodeIds.length;
+      } catch (error) {
+        validation.valid = false;
+        validation.errors++;
+        validation.diagnostics.push({
+          severity: 'error',
+          code: 'STUDIO_INSPECTION_FAILED',
+          path: '/',
+          message:
+            `Studio could not inspect this page structure. ${error instanceof Error ? error.message : ''}`.trim(),
+        });
+      }
       if (localWidgetCount && !isSampleSelection(scope.selection)) {
         validation.valid = false;
         validation.errors++;

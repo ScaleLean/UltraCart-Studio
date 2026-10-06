@@ -71,6 +71,7 @@ export class StudioServices {
   readonly sampleDrafts: DraftService;
   readonly widgetIds: WidgetIdsService;
   private publishBusy = new Set<string>();
+  private reported = new Set<string>();
   constructor(
     readonly store: Store,
     readonly emit: () => void,
@@ -207,12 +208,28 @@ export class StudioServices {
     if (!this.pages().some((p) => p.path === path)) throw new Error('Select a page in this storefront.');
     return draftScopeSchema.parse({ selection: workspace.selection, path, slot });
   }
+  private records(): Record[] {
+    return this.store.db
+      .prepare('SELECT scope_key, record FROM storefront_drafts')
+      .all()
+      .flatMap((row) => {
+        try {
+          return [JSON.parse(row.record as string) as Record];
+        } catch {
+          this.unreadable(row.scope_key as string);
+          return [];
+        }
+      });
+  }
+  private unreadable(key: string) {
+    if (this.reported.has(key)) return;
+    this.reported.add(key);
+    console.error(`Skipped an unreadable draft: ${key}`);
+  }
   private record(id: string): Record {
-    for (const row of this.store.db.prepare('SELECT record FROM storefront_drafts').all()) {
-      const record = JSON.parse(row.record as string) as Record;
-      if (record.id === id) return record;
-    }
-    throw new Error('Draft not found.');
+    const record = this.records().find((r) => r.id === id);
+    if (!record) throw new Error('Draft not found.');
+    return record;
   }
   private snapshot(record: Record, draft: Draft) {
     this.store.db
@@ -256,12 +273,16 @@ export class StudioServices {
     };
   }
   changes(workspace = this.workspace()) {
-    return this.store.db
-      .prepare('SELECT record FROM storefront_drafts')
-      .all()
-      .map((row) => JSON.parse(row.record as string) as Record)
+    return this.records()
       .filter((r) => workspaceId(r.scope.selection) === workspace.id)
-      .map((r) => this.getChange(r.id))
+      .flatMap((r) => {
+        try {
+          return [this.getChange(r.id)];
+        } catch {
+          this.unreadable(r.id);
+          return [];
+        }
+      })
       .sort((a, b) => b.draft.updatedAt.localeCompare(a.draft.updatedAt));
   }
   async pull(scope: DraftScope) {
@@ -366,8 +387,8 @@ export class StudioServices {
       .prepare('SELECT revision, value FROM revisions WHERE draft_id = ? ORDER BY revision DESC')
       .all(id)
       .map((row) => {
-        const v = JSON.parse(row.value as string);
-        return { revision: row.revision, at: v.at, changedFields: v.draft.changedFields };
+        const v = parseJson(row.value as string, `Revision ${row.revision} is unreadable.`);
+        return { revision: row.revision, at: v.at, changedFields: v.draft?.changedFields };
       });
   }
   async restore(scope: DraftScope, id: string, revision: number, expectedRevision: number) {
@@ -379,7 +400,13 @@ export class StudioServices {
       .prepare('SELECT value FROM revisions WHERE draft_id = ? AND revision = ?')
       .get(id, revision);
     if (!row) throw new Error('Revision not found.');
-    const snapshot = JSON.parse(row.value as string) as { draft: Draft; record?: Record };
+    const snapshot = parseJson(
+      row.value as string,
+      'This revision is unreadable and cannot be restored.'
+    ) as {
+      draft: Draft;
+      record?: Record;
+    };
     if (typeof snapshot.record?.content === 'string') {
       this.assertEditable(id);
       const draft = await this.draftService(scope).updateContent(
@@ -441,7 +468,7 @@ export class StudioServices {
         truncated: z.boolean().optional(),
       })
       .parse(
-        JSON.parse(
+        parseJson(
           await this.connection.run([
             '--format',
             'json',
@@ -453,7 +480,8 @@ export class StudioServices {
             path,
             '--storefront',
             String(scope.selection.storefront.id),
-          ])
+          ]),
+          'The toolkit returned an unreadable template.'
         )
       );
     if (response.path !== undefined && response.path !== path)
@@ -502,7 +530,10 @@ export class StudioServices {
       throw new Error('Resolve validation errors or remote changes before previewing.');
     const prefix = ['--format', 'json', '--profile', scope.selection.profileId, 'sf', 'preview'];
     const storefront = ['--storefront', String(scope.selection.storefront.id)];
-    const started = JSON.parse(await this.connection.run([...prefix, 'start', ...storefront]));
+    const started = parseJson(
+      await this.connection.run([...prefix, 'start', ...storefront]),
+      'The toolkit returned an unreadable preview session.'
+    );
     const session = z
       .string()
       .regex(/^[a-fA-F0-9]{32}$/)
@@ -510,7 +541,7 @@ export class StudioServices {
     let staged: any;
     try {
       staged = await this.withFiles(record, async (file) =>
-        JSON.parse(
+        parseJson(
           await this.connection.run([
             ...prefix,
             'stage',
@@ -519,7 +550,8 @@ export class StudioServices {
             session,
             '--file',
             `${file}=${containerPath(scope.path, scope.slot)}`,
-          ])
+          ]),
+          'The toolkit returned an unreadable staging result.'
         )
       );
       const theme = z.number().int().positive().parse(staged.themeOid);
@@ -532,7 +564,7 @@ export class StudioServices {
         createdAt: new Date().toISOString(),
         applied: false,
       } satisfies Preview);
-      const opened = JSON.parse(
+      const opened = parseJson(
         await this.connection.run([
           ...prefix,
           'open',
@@ -543,7 +575,8 @@ export class StudioServices {
           String(theme),
           '--path',
           scope.path,
-        ])
+        ]),
+        'The toolkit returned an unreadable preview link.'
       );
       const url = new URL(z.string().parse(opened.access_url));
       if (
@@ -744,7 +777,9 @@ export class StudioServices {
     this.store.db.exec('BEGIN IMMEDIATE');
     try {
       this.store.db
-        .prepare("UPDATE storefront_drafts SET record = ? WHERE json_extract(record, '$.id') = ?")
+        .prepare(
+          "UPDATE storefront_drafts SET record = ? WHERE json_valid(record) AND json_extract(record, '$.id') = ?"
+        )
         .run(JSON.stringify(next), id);
       const draft = this.remember(this.drafts.read(scope)!);
       this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(`publish-attempt:${id}`);

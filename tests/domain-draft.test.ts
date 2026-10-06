@@ -206,6 +206,34 @@ test('a failed revision snapshot rolls back the draft save', async () => {
     db.close();
   }
 });
+test('unreadable toolkit output and failed structure inspection fail review closed', async () => {
+  assert.throws(() => parseDraftValidation('not json'), /invalid validation report/);
+  assert.throws(() => parseDraftValidation('null'), /invalid validation report/);
+  const { db, drafts } = setup();
+  try {
+    const pulled = await drafts.pull(scope);
+    const row = db.prepare('SELECT scope_key, record FROM storefront_drafts').get() as {
+      scope_key: string;
+      record: string;
+    };
+    const record = JSON.parse(row.record);
+    const tree = JSON.parse(record.content);
+    tree.childWidgets[0].config.text = 'Updated';
+    tree.childWidgets.push({ ...tree.childWidgets[0] });
+    record.content = JSON.stringify(tree);
+    db.prepare('UPDATE storefront_drafts SET record = ? WHERE scope_key = ?').run(
+      JSON.stringify(record),
+      row.scope_key
+    );
+    const reviewed = await drafts.review({ ...scope, id: pulled.id, revision: 1 });
+    assert.equal(reviewed.validation.valid, false);
+    assert(reviewed.validation.diagnostics.some((d) => d.code === 'STUDIO_INSPECTION_FAILED'));
+    db.prepare('UPDATE storefront_drafts SET record = ? WHERE scope_key = ?').run('{', row.scope_key);
+    assert.throws(() => drafts.read(scope), /saved draft is unreadable/);
+  } finally {
+    db.close();
+  }
+});
 test('validation diagnostics and strict draft inputs fail closed', () => {
   const report = parseDraftValidation(
     JSON.stringify({

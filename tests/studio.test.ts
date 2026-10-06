@@ -112,6 +112,39 @@ test('stale revisions and mismatched page scopes cannot overwrite drafts', async
     await f.cleanup();
   }
 });
+test('unreadable stored rows are skipped or reported without crashing the workspace', async () => {
+  const f = await fixture();
+  const error = console.error;
+  console.error = () => {};
+  try {
+    const scope = f.service.scope('/');
+    const draft = await f.service.pull(scope);
+    f.store.db.prepare('INSERT INTO storefront_drafts (scope_key, record) VALUES (?, ?)').run('broken', '{');
+    f.store.db
+      .prepare('INSERT INTO activity (id, workspace_id, at, value) VALUES (?, ?, ?, ?)')
+      .run('broken', f.service.workspace().id, '9999', '{');
+    f.store.db
+      .prepare('INSERT INTO sessions (id, workspace_id, updated_at, value) VALUES (?, ?, ?, ?)')
+      .run('broken', f.service.workspace().id, '9999', '{');
+    assert.deepEqual(
+      f.service.changes().map((c) => c.id),
+      [draft.id]
+    );
+    assert(f.store.activity(f.service.workspace().id).length > 0);
+    assert.deepEqual(f.store.sessions(f.service.workspace().id), []);
+    assert.deepEqual(f.store.pendingSessions(), []);
+    assert.throws(() => f.store.session('broken'), /conversation is unreadable/);
+    f.store.db.prepare('UPDATE revisions SET value = ? WHERE draft_id = ?').run('{', draft.id);
+    assert.throws(() => f.service.history(draft.id), /Revision 1 is unreadable/);
+    await assert.rejects(f.service.restore(scope, draft.id, 1, 1), /revision is unreadable/);
+    f.store.db.prepare('INSERT INTO kv (key, value) VALUES (?, ?)').run(`publish-attempt:${draft.id}`, '{');
+    assert.throws(() => f.service.getChange(draft.id), /publish-attempt data is unreadable/);
+    assert.deepEqual(f.service.changes(), []);
+  } finally {
+    console.error = error;
+    await f.cleanup();
+  }
+});
 test('saved content survives database reopen', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'studio-reopen-'));
   let store = new Store(directory);
