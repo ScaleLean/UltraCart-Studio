@@ -280,3 +280,43 @@ test('a non-JSON pull during verification is a recoverable error', async () => {
     await f.cleanup();
   }
 });
+test('a corrupt conversation row does not stop the startup workspace migration', async () => {
+  const f = await fixture();
+  try {
+    const selection: Selection = f.store.get<Workspace>('workspace', {} as Workspace).selection;
+    const current = workspaceId(selection);
+    const old: Workspace = { id: 'legacy-id', kind: 'live', label: 'Test store', selection };
+    f.store.set('workspace', old);
+    f.store.set('pages:legacy-id', samplePages);
+    const good = {
+      id: 'good',
+      workspaceId: 'legacy-id',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      scope: { selection: selection, path: '/', slot: 'body' },
+    };
+    f.store.db
+      .prepare('INSERT INTO sessions (id, workspace_id, updated_at, value) VALUES (?, ?, ?, ?)')
+      .run('good', 'legacy-id', good.updatedAt, JSON.stringify(good));
+    for (const [id, value] of [
+      ['bad-json', '{nope'],
+      ['bad-shape', '{"id":"x"}'],
+    ])
+      f.store.db
+        .prepare('INSERT INTO sessions (id, workspace_id, updated_at, value) VALUES (?, ?, ?, ?)')
+        .run(id, 'legacy-id', good.updatedAt, value);
+    const originalError = console.error;
+    const logged: string[] = [];
+    console.error = (message: string) => void logged.push(message);
+    let migrated: StudioServices;
+    try {
+      migrated = new StudioServices(f.store, () => {}, f.store.directory);
+    } finally {
+      console.error = originalError;
+    }
+    assert.equal(migrated.workspace().id, current);
+    assert.equal(f.store.session('good').workspaceId, current);
+    assert.equal(logged.length, 2);
+  } finally {
+    await f.cleanup();
+  }
+});

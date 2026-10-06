@@ -136,6 +136,7 @@ export function WorkspaceCanvas({
   const [publishOpen, setPublishOpen] = useState(false);
   const [confirmation, setConfirmation] = useState('');
   const [abandonOpen, setAbandonOpen] = useState(false);
+  const [abandonNeedsHost, setAbandonNeedsHost] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
   const [idsOpen, setIdsOpen] = useState(false);
@@ -587,6 +588,7 @@ export function WorkspaceCanvas({
                     disabled={!!action}
                     onClick={() => {
                       setConfirmation('');
+                      setAbandonNeedsHost(false);
                       setAbandonOpen(true);
                     }}
                   >
@@ -869,37 +871,51 @@ export function WorkspaceCanvas({
               {draft?.revision} stays in history.
             </DialogDescription>
           </DialogHeader>
-          <FieldGroup>
-            <Field>
-              <FieldLabel htmlFor="abandon-confirm">
-                Type {data.workspace.selection.storefront.host} to confirm
-              </FieldLabel>
-              <Input
-                id="abandon-confirm"
-                value={confirmation}
-                onChange={(event) => setConfirmation(event.target.value)}
-              />
-            </Field>
-          </FieldGroup>
+          {abandonNeedsHost && (
+            <FieldGroup>
+              <Field>
+                <FieldLabel htmlFor="abandon-confirm">
+                  Type {data.workspace.selection.storefront.host} to confirm
+                </FieldLabel>
+                <Input
+                  id="abandon-confirm"
+                  value={confirmation}
+                  onChange={(event) => setConfirmation(event.target.value)}
+                />
+              </Field>
+            </FieldGroup>
+          )}
           <DialogFooter>
             <Button variant="outline" onClick={() => setAbandonOpen(false)}>
               Cancel
             </Button>
             <Button
-              disabled={confirmation !== data.workspace.selection.storefront.host || !!action}
-              onClick={() =>
-                run('abandon', async () => {
+              disabled={
+                (abandonNeedsHost && confirmation !== data.workspace.selection.storefront.host) || !!action
+              }
+              onClick={async () => {
+                setAction('abandon');
+                try {
                   await invoke('draft.abandon', {
                     path: page.path,
                     slot,
                     id: draft!.id,
                     revision: draft!.revision,
-                    confirmation,
+                    confirmation: abandonNeedsHost ? confirmation : '',
                   });
                   toast.success('Publish attempt abandoned');
                   setAbandonOpen(false);
-                })
-              }
+                  await refresh();
+                } catch (error) {
+                  // Main only asks for the host when the live page matches neither revision nor baseline.
+                  if (!abandonNeedsHost && /exact storefront host/.test(errorText(error))) {
+                    setAbandonNeedsHost(true);
+                    toast.info('The live page has changed. Type the storefront host to replace the draft.');
+                  } else toast.error(errorText(error));
+                } finally {
+                  if (mounted.current) setAction('');
+                }
+              }}
             >
               {action === 'abandon' && <LoaderCircle className="spin" data-icon="inline-start" />}Abandon
               attempt
