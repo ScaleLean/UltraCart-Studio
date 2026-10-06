@@ -16,6 +16,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { StudioEvent } from '../shared/types';
+import type { WarehouseStatus } from '../shared/warehouse';
 import { assertSecureCredentialStorage } from './secure-storage';
 
 app.setName('UltraCart Studio');
@@ -296,6 +297,28 @@ async function openPreview(params: any) {
   return { opened: true };
 }
 
+// The renderer never supplies the bq executable path. Main asks the user through a native dialog,
+// and the worker persists only the path the dialog returned.
+async function pickBqPath(params: unknown) {
+  const { workspaceId } = z
+    .object({ workspaceId: z.string().min(1).max(100) })
+    .strict()
+    .parse(params);
+  const current: WarehouseStatus = await call('warehouse.status', { workspaceId });
+  if (current.sample) throw new Error('The sample workspace does not run the BigQuery CLI.');
+  const result = await dialog.showOpenDialog(win, {
+    title: process.platform === 'win32' ? 'Choose the BigQuery CLI (bq.cmd)' : 'Choose the BigQuery CLI (bq)',
+    defaultPath: current.config.bqPath || undefined,
+    properties: ['openFile', 'showHiddenFiles'],
+    filters:
+      process.platform === 'win32' ? [{ name: 'BigQuery CLI', extensions: ['cmd', 'exe'] }] : undefined,
+  });
+  const path = result.filePaths[0];
+  if (result.canceled || !path) return { changed: false, status: current };
+  if (path === current.config.bqPath) return { changed: false, status: current };
+  return { changed: true, status: await call('warehouse.setBqPath', { workspaceId, bqPath: path }) };
+}
+
 ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) => {
   trusted(event);
   await ready;
@@ -310,6 +333,7 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
       auth: { ...result.auth, connected: false, phase: 'error', message: credentialLoadError },
     };
   }
+  if (method === 'warehouse.pickBqPath') return pickBqPath(params);
   if (publicMethods.has(method)) return call(method, params);
   if (method === 'preview.open') return openPreview(params);
   if (method === 'preview.close') {

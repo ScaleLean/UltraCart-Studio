@@ -20,6 +20,7 @@ import { StudioServices, workspaceId } from '../src/main/services';
 import { LandingService } from '../src/main/landing';
 import { PageBuilderService } from '../src/main/page-builder';
 import { WarehouseService } from '../src/main/warehouse';
+import { WAREHOUSE_MIN_BYTES } from '../src/shared/warehouse';
 import { Auth, LocalCredentials } from '../src/main/auth';
 import { Agents } from '../src/main/agent';
 import { featureTools, type AgentFeatures } from '../src/main/feature-tools';
@@ -218,9 +219,13 @@ test(
     try {
       const session = await f.agents.createWarehouse();
       let names: string[] = [];
+      let saveBytes: any;
       f.faux.setResponses([
         (context) => {
-          names = getCurrentTools(context.messages).map((tool) => tool.name);
+          const tools = getCurrentTools(context.messages);
+          names = tools.map((tool) => tool.name);
+          saveBytes = (tools.find((tool) => tool.name === 'warehouse_save_query')?.parameters as any)?.properties
+            ?.maxBytes;
           return fauxAssistantMessage(fauxToolCall('warehouse_status', {}), { stopReason: 'toolUse' });
         },
         fauxAssistantMessage(fauxToolCall('warehouse_list_tables', {}), { stopReason: 'toolUse' }),
@@ -250,6 +255,8 @@ test(
         'warehouse_save_query',
         'warehouse_status',
       ]);
+      // The agent schema uses BigQuery's 10 MiB billing minimum, like every other byte ceiling.
+      assert.equal(saveBytes?.minimum, WAREHOUSE_MIN_BYTES);
       const status = f.features.warehouse.status({ workspaceId: 'sample' });
       assert.equal(status.saved[0].name, 'Orders by channel for review');
       assert.equal(status.saved[0].rowLimit, 50);

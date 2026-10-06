@@ -162,6 +162,9 @@ async function dispatch(method: string, input: any) {
       return warehouse.status(input);
     case 'warehouse.configure':
       return warehouse.configure(input);
+    // Host-only: main calls this after a native file dialog. It is not in the public allowlist.
+    case 'warehouse.setBqPath':
+      return warehouse.setBqPath(input);
     case 'warehouse.tables':
       return warehouse.tables(input);
     case 'warehouse.schema':

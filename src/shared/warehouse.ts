@@ -53,6 +53,10 @@ export function warehouseAbsolutePath(value: string) {
     (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+[\\/]/.test(value))
   );
 }
+/** A full path whose file name is the BigQuery CLI launcher: bq, bq.cmd or bq.exe, in any case. */
+export function warehouseBqPath(value: string) {
+  return warehouseAbsolutePath(value) && /(?:^|[\\/])bq(?:\.cmd|\.exe)?$/i.test(value);
+}
 export type WarehouseTable = { name: string; type: string; description?: string };
 export type WarehouseField = { path: string; type: string; mode: string; description?: string };
 export type WarehouseSchema = { table: string; fields: WarehouseField[]; fetchedAt: string; sample: boolean };
