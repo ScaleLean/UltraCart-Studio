@@ -495,13 +495,44 @@ app.whenReady().then(async () => {
       win.hide();
     }
   });
+  // Once a quit is confirmed, the renderer's unsaved-edits guard must not block the window closing.
+  win.webContents.on('will-prevent-unload', (event) => {
+    if (quitting) event.preventDefault();
+  });
   app.on('activate', () => win.show());
   launchWorker();
   if (development) await win.loadURL('http://127.0.0.1:5178');
   else await win.loadFile(join(__dirname, 'renderer/index.html'));
   win.show();
 });
+let quitConfirmed = false;
+// Ask the renderer about unsaved edits before anything is torn down; cancelling keeps a live engine.
+async function confirmQuit() {
+  let unsaved = false;
+  try {
+    unsaved = !!(await win.webContents.executeJavaScript('window.__studioHasUnsaved?.() === true'));
+  } catch {}
+  if (unsaved) {
+    win.show();
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'warning',
+      buttons: ['Quit and discard', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      message: 'You have unsaved edits.',
+      detail: 'Quitting now discards edits that have not been saved.',
+    });
+    if (response !== 0) return;
+  }
+  quitConfirmed = true;
+  app.quit();
+}
 app.on('before-quit', (event) => {
+  if (!quitting && !quitConfirmed && win && !win.isDestroyed()) {
+    event.preventDefault();
+    void confirmQuit();
+    return;
+  }
   if (!quitting) {
     quitting = true;
     closePreview();
