@@ -1,4 +1,5 @@
 import { ArrowUpRight, ArrowRight, ShoppingBag, Leaf } from 'lucide-react';
+import type { KeyboardEvent } from 'react';
 import type { Draft } from '../../shared/types';
 import { sampleBody } from '../../shared/sample';
 import { cn } from '../lib/utils';
@@ -23,11 +24,25 @@ export function SamplePreview({
     const field = draft?.fields.find((f) => f.pointer === `/childWidgets/${index}/config/${key}`);
     return field ? (original ? field.before : field.value) : baseline.childWidgets[index].config[key];
   };
-  const field = (index: number, key = 'text') => ({
-    'data-editable': editable,
-    onClick: editable ? () => onSelect?.(`/childWidgets/${index}/config/${key}`) : undefined,
-    title: editable ? 'Edit this text' : undefined,
-  });
+  const field = (index: number, key = 'text') => {
+    const select = () => onSelect?.(`/childWidgets/${index}/config/${key}`);
+    return {
+      'data-editable': editable,
+      onClick: editable ? select : undefined,
+      title: editable ? 'Edit this text' : undefined,
+      role: editable ? ('button' as const) : undefined,
+      tabIndex: editable ? 0 : undefined,
+      onKeyDown: editable
+        ? (event: KeyboardEvent<HTMLElement>) => {
+            if (event.target !== event.currentTarget) return;
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              select();
+            }
+          }
+        : undefined,
+    };
+  };
   return (
     <div className={cn('sample-store', mobile && 'is-mobile')}>
       <div className="sample-announcement" {...field(5)}>

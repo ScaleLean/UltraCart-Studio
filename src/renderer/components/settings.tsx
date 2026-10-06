@@ -192,7 +192,11 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
                   </div>
                   {data.auth.message && <p className="settings-note">{data.auth.message}</p>}
                   {data.auth.phase === 'waiting' && (
-                    <Button variant="ghost" size="sm" onClick={() => invoke('auth.cancel')}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => invoke('auth.cancel').catch((e) => toast.error(errorText(e)))}
+                    >
                       Cancel sign-in
                     </Button>
                   )}
@@ -596,9 +600,13 @@ export function ConnectDialog({ open, onOpenChange, data, refresh }: DialogProps
           <Button
             variant="ghost"
             onClick={async () => {
-              await invoke('workspace.sample');
-              await refresh();
-              onOpenChange(false);
+              try {
+                await invoke('workspace.sample');
+                await refresh();
+                onOpenChange(false);
+              } catch (error) {
+                toast.error(errorText(error));
+              }
             }}
           >
             Use sample store

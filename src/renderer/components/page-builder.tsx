@@ -50,6 +50,15 @@ type Props = {
   onChange: () => Promise<void> | void;
   onSelectSection?: (node: BuilderNode) => void;
 };
+const cacheName = (draftId: string) => `studio-builder-unsaved:${draftId}`;
+function readCache(draftId: string): { revision: number; values: Record<string, string> } | null {
+  try {
+    const cached = JSON.parse(localStorage.getItem(cacheName(draftId)) || 'null');
+    if (cached?.values && typeof cached.values === 'object' && Number.isSafeInteger(cached.revision))
+      return cached;
+  } catch {}
+  return null;
+}
 function flatten(root: BuilderNode, depth = 0): { node: BuilderNode; depth: number }[] {
   return [{ node: root, depth }, ...root.children.flatMap((child) => flatten(child, depth + 1))];
 }
@@ -72,7 +81,9 @@ export function PageBuilder({
   const [device, setDevice] = useState('desktop');
   const [version, setVersion] = useState('draft');
   const [values, setValues] = useState<Record<string, string>>({});
+  const [baseRevision, setBaseRevision] = useState<number | null>(null);
   const [removing, setRemoving] = useState(false);
+  const hydrated = useRef('');
   const activePath = useRef(path);
   activePath.current = path;
   useEffect(() => {
@@ -83,7 +94,13 @@ export function PageBuilder({
       .then((result) => {
         if (!cancelled) {
           setView(result);
-          setValues({});
+          // Keep what the user typed when the revision changes; restore cached edits after a remount.
+          if (result && hydrated.current !== result.draft.id) {
+            const cached = readCache(result.draft.id);
+            hydrated.current = result.draft.id;
+            setValues(cached?.values ?? {});
+            setBaseRevision(cached ? cached.revision : null);
+          }
           setSelectedId((current) =>
             result && flatten(result.root).some((item) => item.node.id === current)
               ? current
@@ -117,10 +134,34 @@ export function PageBuilder({
         (field.pointer.startsWith(`${selected.pointer}/config/`) ||
           (selected.pointer && field.pointer.startsWith(`${selected.pointer}/childWidgets/`)))
     ) ?? [];
+  const dirty =
+    !!view &&
+    view.draft.fields.some(
+      (field) => values[field.pointer] !== undefined && values[field.pointer] !== field.value
+    );
+  const stale = dirty && baseRevision !== null && view?.draft.revision !== baseRevision;
   const edits = selectedFields
     .filter((field) => values[field.pointer] !== undefined && values[field.pointer] !== field.value)
     .map((field) => ({ pointer: field.pointer, value: values[field.pointer] }));
   const locked = disabled || !!busy;
+  const draftId = view?.draft.id;
+  useEffect(() => {
+    if (!view || !draftId || hydrated.current !== draftId) return;
+    try {
+      if (dirty) localStorage.setItem(cacheName(draftId), JSON.stringify({ revision: baseRevision, values }));
+      else localStorage.removeItem(cacheName(draftId));
+    } catch {
+      toast.error('Unsaved edits could not be cached. Save your draft before closing.');
+    }
+  }, [values, dirty, baseRevision, draftId]);
+  function editField(pointer: string, value: string) {
+    setValues((current) => ({ ...current, [pointer]: value }));
+    setBaseRevision((current) => current ?? view?.draft.revision ?? null);
+  }
+  function clearEdits() {
+    setValues({});
+    setBaseRevision(null);
+  }
   const parent = allNodes.find((item) => item.node.id === selected?.parentId)?.node;
   const index = parent?.children.findIndex((node) => node.id === selectedId) ?? -1;
   const changedIds = new Set(view?.structureChanges.map((change) => change.id));
@@ -138,8 +179,8 @@ export function PageBuilder({
   }
   async function apply(operation: BuilderOperation) {
     if (!view) return;
-    if (edits.length) {
-      setError('Save or discard the selected text edits before changing the structure.');
+    if (dirty) {
+      setError('Save or discard your text edits before changing the structure.');
       return;
     }
     await execute(operation.kind, async () => {
@@ -152,7 +193,7 @@ export function PageBuilder({
       });
       if (activePath.current !== path) return;
       setView(result);
-      setValues({});
+      clearEdits();
       setRemoving(false);
       setVersion('draft');
       if (operation.kind === 'add') {
@@ -171,18 +212,19 @@ export function PageBuilder({
       const result = await invoke<PageBuilderView>('builder.inspect', { path, slot });
       if (activePath.current !== path) return;
       setView(result);
+      if (result) hydrated.current = result.draft.id;
       setSelectedId(result.root.children[0]?.id ?? result.root.id);
       await onChange();
     });
   }
   async function saveText() {
-    if (!view || !edits.length) return;
+    if (!view || !edits.length || stale) return;
     await execute('text', async () => {
       await invoke('draft.save', { path, slot, id: view.draft.id, revision: view.draft.revision, edits });
       const result = await invoke<PageBuilderView>('builder.inspect', { path, slot });
       if (activePath.current !== path) return;
       setView(result);
-      setValues({});
+      clearEdits();
       await onChange();
       toast.success('Section text saved');
     });
@@ -233,7 +275,7 @@ export function PageBuilder({
         <span>
           {busy ? (
             'Saving…'
-          ) : edits.length ? (
+          ) : dirty ? (
             'Unsaved text edits'
           ) : (
             <>
@@ -242,6 +284,18 @@ export function PageBuilder({
           )}
         </span>
       </div>
+      {stale && (
+        <Alert variant="destructive" className="builder-alert">
+          <TriangleAlert />
+          <AlertDescription>
+            A newer revision was saved while you were editing. Your unsaved text is preserved. Copy any text
+            you want to keep before loading the latest version.
+            <Button size="sm" variant="outline" onClick={clearEdits}>
+              Load latest saved fields
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
       {error && (
         <Alert variant="destructive" className="builder-alert">
           <TriangleAlert />
@@ -426,9 +480,7 @@ export function PageBuilder({
                           maxLength={16384}
                           disabled={locked}
                           rows={field.key.includes('html') ? 4 : 2}
-                          onChange={(event) =>
-                            setValues((current) => ({ ...current, [field.pointer]: event.target.value }))
-                          }
+                          onChange={(event) => editField(field.pointer, event.target.value)}
                         />
                         {field.key.includes('html') && (
                           <FieldDescription>Rich text keeps the storefront HTML.</FieldDescription>
@@ -441,10 +493,10 @@ export function PageBuilder({
                   )}
                   {edits.length > 0 && (
                     <div className="builder-save">
-                      <Button size="sm" disabled={locked} onClick={() => void saveText()}>
+                      <Button size="sm" disabled={locked || stale} onClick={() => void saveText()}>
                         Save text
                       </Button>
-                      <Button variant="ghost" size="sm" disabled={locked} onClick={() => setValues({})}>
+                      <Button variant="ghost" size="sm" disabled={locked} onClick={clearEdits}>
                         Discard
                       </Button>
                     </div>

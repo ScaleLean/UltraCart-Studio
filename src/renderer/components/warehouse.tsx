@@ -719,7 +719,16 @@ export function Warehouse({
   const [rail, setRail] = useState<'tables' | 'saved'>('tables');
   const [panel, setPanel] = useState<'results' | 'schema' | 'history'>('results');
   const [filter, setFilter] = useState('');
-  const [sql, setSql] = useState(boot.workspace.kind === 'sample' ? warehouseDemoQueries[0].sql : blankQuery);
+  const sqlKey = `studio-warehouse-sql:${boot.workspace.id}`;
+  const defaultSql = boot.workspace.kind === 'sample' ? warehouseDemoQueries[0].sql : blankQuery;
+  const readSqlDraft = () => {
+    try {
+      return sessionStorage.getItem(sqlKey) ?? defaultSql;
+    } catch {
+      return defaultSql;
+    }
+  };
+  const [sql, setSql] = useState(readSqlDraft);
   const [rowLimit, setRowLimit] = useState(100);
   const [maxBytes, setMaxBytes] = useState(WAREHOUSE_DEFAULT_BYTES);
   const [prepared, setPrepared] = useState<WarehousePrepared | null>(null);
@@ -758,7 +767,7 @@ export function Warehouse({
     setHistory([]);
     setSaved([]);
     setActiveSaved(undefined);
-    setSql(sample ? warehouseDemoQueries[0].sql : blankQuery);
+    setSql(readSqlDraft());
     void request<WarehouseStatus>('status')
       .then(async (next) => {
         if (id !== generation.current) return;
@@ -784,6 +793,12 @@ export function Warehouse({
       generation.current++;
     };
   }, [workspaceId, boot.workspace.selection.verifiedAt]);
+  useEffect(() => {
+    try {
+      if (sql === defaultSql) sessionStorage.removeItem(sqlKey);
+      else sessionStorage.setItem(sqlKey, sql);
+    } catch {}
+  }, [sql, sqlKey, defaultSql]);
   useEffect(
     () =>
       subscribe((event) => {

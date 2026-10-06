@@ -150,6 +150,7 @@ export function WorkspaceCanvas({
   const isOverlay = overlayOpen || publishOpen || abandonOpen || historyOpen || idsOpen || !!source;
   const currentPath = useRef(page.path);
   currentPath.current = page.path;
+  const runToken = useRef(0);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -158,6 +159,8 @@ export function WorkspaceCanvas({
     };
   }, []);
   useEffect(() => {
+    runToken.current++;
+    setAction('');
     setTemplates(null);
     setSource(null);
     setSelectedField('');
@@ -214,6 +217,7 @@ export function WorkspaceCanvas({
     };
   }, [page.path, sample]);
   async function run(name: string, work: () => Promise<unknown>) {
+    const token = ++runToken.current;
     setAction(name);
     try {
       await work();
@@ -221,12 +225,14 @@ export function WorkspaceCanvas({
     } catch (error) {
       toast.error(errorText(error));
     } finally {
-      if (mounted.current) setAction('');
+      if (mounted.current && runToken.current === token) setAction('');
     }
   }
   async function pull() {
+    const path = page.path;
     await run('pull', async () => {
-      await invoke('draft.pull', { path: page.path, slot });
+      await invoke('draft.pull', { path, slot });
+      if (currentPath.current !== path) return;
       setPanel('fields');
       toast.success('Local draft opened');
     });
@@ -383,7 +389,11 @@ export function WorkspaceCanvas({
                 </span>
                 <IconButton
                   label="Reload preview"
-                  onClick={() => (sample ? setDraftPreview(true) : void invoke('preview.reload'))}
+                  onClick={() =>
+                    sample
+                      ? setDraftPreview(true)
+                      : void invoke('preview.reload').catch((e) => toast.error(errorText(e)))
+                  }
                 >
                   <RefreshCw />
                 </IconButton>
@@ -402,7 +412,11 @@ export function WorkspaceCanvas({
                   <EmptyState title="Preview unavailable" description={nativeStatus.error}>
                     <Button
                       variant="outline"
-                      onClick={() => invoke('window.openStore', { path: page.path, slot })}
+                      onClick={() =>
+                        void invoke('window.openStore', { path: page.path, slot }).catch((e) =>
+                          toast.error(errorText(e))
+                        )
+                      }
                     >
                       Open in browser
                       <ArrowUpRight data-icon="inline-end" />
@@ -674,6 +688,7 @@ export function WorkspaceCanvas({
           </div>
           {panel === 'agent' && (
             <AgentPanel
+              key={`${page.path}:${slot}`}
               data={data}
               page={page}
               slot={slot}
@@ -738,9 +753,11 @@ export function WorkspaceCanvas({
                   variant="outline"
                   disabled={!!action}
                   onClick={() =>
-                    run('templates', async () =>
-                      setTemplates(await invoke('page.templates', { path: page.path, slot }))
-                    )
+                    run('templates', async () => {
+                      const path = page.path;
+                      const result = await invoke<TemplateResult>('page.templates', { path, slot });
+                      if (currentPath.current === path) setTemplates(result);
+                    })
                   }
                 >
                   Resolve template
@@ -993,6 +1010,13 @@ export function AgentPanel({
   const [sending, setSending] = useState(false);
   const [steer, setSteer] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   const warehouse = !!target && 'warehouse' in target;
   const landing = !!target && 'landingId' in target;
   const suggestions = warehouse
@@ -1075,13 +1099,14 @@ export function AgentPanel({
     try {
       const id =
         activeSession || (await invoke<Session>('session.create', target ?? { path: page.path, slot })).id;
-      if (!activeSession) setActiveSession(id);
+      // The user may have moved to another page while the session was being created.
+      if (!activeSession && alive.current) setActiveSession(id);
       await invoke('session.send', { id, text: text.trim(), requestId: crypto.randomUUID(), steer });
-      setText('');
+      if (alive.current) setText('');
     } catch (error) {
       toast.error(errorText(error));
     } finally {
-      setSending(false);
+      if (alive.current) setSending(false);
     }
   }
   return (
