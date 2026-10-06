@@ -386,7 +386,11 @@ export function WorkspaceCanvas({
                 </span>
                 <IconButton
                   label="Reload preview"
-                  onClick={() => (sample ? setDraftPreview(true) : void invoke('preview.reload'))}
+                  onClick={() =>
+                    sample
+                      ? setDraftPreview(true)
+                      : void invoke('preview.reload').catch((e) => toast.error(errorText(e)))
+                  }
                 >
                   <RefreshCw />
                 </IconButton>
@@ -405,7 +409,11 @@ export function WorkspaceCanvas({
                   <EmptyState title="Preview unavailable" description={nativeStatus.error}>
                     <Button
                       variant="outline"
-                      onClick={() => invoke('window.openStore', { path: page.path, slot })}
+                      onClick={() =>
+                        void invoke('window.openStore', { path: page.path, slot }).catch((e) =>
+                          toast.error(errorText(e))
+                        )
+                      }
                     >
                       Open in browser
                       <ArrowUpRight data-icon="inline-end" />

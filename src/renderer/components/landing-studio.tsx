@@ -27,8 +27,10 @@ import type { Bootstrap } from '../../shared/types';
 import {
   applyBuilderOperation,
   createPageDocument,
+  escapeHtml,
   parsePageDocument,
   serializePageDocument,
+  textHtml,
   type BuilderOperation,
   type CjsonNode,
   type SectionPattern,
@@ -77,13 +79,6 @@ const sectionNames: Record<SectionPattern, string> = {
   cta: 'Action',
 };
 const clone = <T,>(value: T): T => structuredClone(value);
-const escapeHtml = (value: string) =>
-  value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 
 export function LandingStudio({
   boot,
@@ -290,7 +285,7 @@ export function LandingStudio({
         if (key === 'title') node.title = value;
         else if (key === 'html') {
           const tag = String(node.config.html ?? '').match(/^<(h[1-6]|p)>/i)?.[1] ?? 'p';
-          node.config.html = `<${tag}>${escapeHtml(value).replace(/\n/g, '<br>')}</${tag}>`;
+          node.config.html = textHtml(value, tag);
         } else
           node.config[key] = ['accordionItemTitle', 'buttonText'].includes(key) ? escapeHtml(value) : value;
       }
