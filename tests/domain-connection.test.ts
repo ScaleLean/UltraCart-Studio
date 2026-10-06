@@ -242,3 +242,19 @@ test('structured failure output is opt-in for validation and widget lookup', asy
     await f.cleanup();
   }
 });
+test('child observer reports toolkit processes until they exit', async () => {
+  const events: string[] = [];
+  ConnectionService.childObserver = (pid, state) => events.push(`${state}:${pid > 0}`);
+  const f = await fixture(`process.stderr.write(${JSON.stringify(challenge)}); setInterval(()=>{},1000);`);
+  try {
+    const state = await f.service.begin('test-store');
+    await waitUntil(() => f.service.loginStatus(state.id).phase === 'waiting');
+    assert.deepEqual(events, ['started:true']);
+    f.service.dispose();
+    await waitUntil(() => events.length === 2);
+    assert.deepEqual(events, ['started:true', 'exited:true']);
+  } finally {
+    ConnectionService.childObserver = null;
+    await f.cleanup();
+  }
+});

@@ -150,6 +150,14 @@ export class StudioServices {
     this.emit();
     return parsed;
   }
+  /** Persists one executable path chosen through a native dialog in the main process. */
+  savePath(kind: 'nodePath' | 'cliPath', path: string) {
+    const parsed = z.string().max(4096).refine(isAbsolute).parse(path);
+    const next = { ...this.settings(), [kind]: parsed };
+    this.store.set('settings', next);
+    this.emit();
+    return next;
+  }
   workspace() {
     return this.store.get<Workspace>('workspace', sampleWorkspace);
   }
