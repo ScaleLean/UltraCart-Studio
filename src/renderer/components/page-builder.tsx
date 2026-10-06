@@ -50,7 +50,36 @@ type Props = {
   onChange: () => Promise<void> | void;
   onSelectSection?: (node: BuilderNode) => void;
 };
-const cacheName = (draftId: string) => `studio-builder-unsaved:${draftId}`;
+const CACHE_PREFIX = 'studio-builder-unsaved:';
+const CACHE_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 50;
+const cacheName = (draftId: string) => `${CACHE_PREFIX}${draftId}`;
+function clearCache(draftId: string) {
+  try {
+    localStorage.removeItem(cacheName(draftId));
+  } catch {}
+}
+// Drop edits cached for drafts that were abandoned: too old, or beyond the newest entries.
+function pruneCache() {
+  try {
+    const entries: { key: string; savedAt: number }[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(CACHE_PREFIX)) continue;
+      let savedAt = 0;
+      try {
+        savedAt = Number(JSON.parse(localStorage.getItem(key) || 'null')?.savedAt) || 0;
+      } catch {}
+      entries.push({ key, savedAt });
+    }
+    entries.sort((a, b) => b.savedAt - a.savedAt);
+    const now = Date.now();
+    entries.forEach((entry, index) => {
+      if (index >= CACHE_MAX_ENTRIES || now - entry.savedAt > CACHE_MAX_AGE)
+        localStorage.removeItem(entry.key);
+    });
+  } catch {}
+}
 function readCache(draftId: string): { revision: number; values: Record<string, string> } | null {
   try {
     const cached = JSON.parse(localStorage.getItem(cacheName(draftId)) || 'null');
@@ -86,6 +115,7 @@ export function PageBuilder({
   const hydrated = useRef('');
   const activePath = useRef(path);
   activePath.current = path;
+  useEffect(pruneCache, []);
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -94,6 +124,8 @@ export function PageBuilder({
       .then((result) => {
         if (!cancelled) {
           setView(result);
+          // The draft no longer exists: its cached edits can never be restored.
+          if (!result && hydrated.current) clearCache(hydrated.current);
           // Keep what the user typed when the revision changes; restore cached edits after a remount.
           if (result && hydrated.current !== result.draft.id) {
             const cached = readCache(result.draft.id);
@@ -148,7 +180,11 @@ export function PageBuilder({
   useEffect(() => {
     if (!view || !draftId || hydrated.current !== draftId) return;
     try {
-      if (dirty) localStorage.setItem(cacheName(draftId), JSON.stringify({ revision: baseRevision, values }));
+      if (dirty)
+        localStorage.setItem(
+          cacheName(draftId),
+          JSON.stringify({ revision: baseRevision, values, savedAt: Date.now() })
+        );
       else localStorage.removeItem(cacheName(draftId));
     } catch {
       toast.error('Unsaved edits could not be cached. Save your draft before closing.');
@@ -159,6 +195,7 @@ export function PageBuilder({
     setBaseRevision((current) => current ?? view?.draft.revision ?? null);
   }
   function clearEdits() {
+    if (view) clearCache(view.draft.id);
     setValues({});
     setBaseRevision(null);
   }
@@ -221,6 +258,7 @@ export function PageBuilder({
     if (!view || !edits.length || stale) return;
     await execute('text', async () => {
       await invoke('draft.save', { path, slot, id: view.draft.id, revision: view.draft.revision, edits });
+      clearCache(view.draft.id);
       const result = await invoke<PageBuilderView>('builder.inspect', { path, slot });
       if (activePath.current !== path) return;
       setView(result);

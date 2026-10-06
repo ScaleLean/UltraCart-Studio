@@ -195,6 +195,14 @@ export function App() {
     document.documentElement.dataset.theme = data?.settings.theme || 'light';
   }, [data?.settings.theme]);
   useEffect(() => {
+    // The main process asks this before quitting so it can confirm natively before stopping the engine.
+    (window as unknown as { __studioHasUnsaved?: () => boolean }).__studioHasUnsaved = () =>
+      unsaved.current.size > 0;
+    return () => {
+      delete (window as unknown as { __studioHasUnsaved?: () => boolean }).__studioHasUnsaved;
+    };
+  }, []);
+  useEffect(() => {
     const handler = (event: BeforeUnloadEvent) => {
       if (unsaved.current.size) event.preventDefault();
     };
@@ -741,7 +749,22 @@ export function App() {
         refresh={refresh}
         initialTab={screen === 'toolkit' ? 'runtime' : undefined}
       />
-      <ConnectDialog open={connect} onOpenChange={setConnect} data={data} refresh={refresh} />
+      <ConnectDialog
+        open={connect}
+        onOpenChange={setConnect}
+        data={data}
+        refresh={refresh}
+        guard={(action) => {
+          if (unsaved.current.size)
+            setDiscard({
+              action: () => {
+                unsaved.current.clear();
+                action();
+              },
+            });
+          else action();
+        }}
+      />
       <CommandDialog
         open={palette}
         onOpenChange={setPalette}

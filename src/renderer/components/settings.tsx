@@ -43,6 +43,8 @@ type DialogProps = {
   data: Bootstrap;
   refresh: () => Promise<void>;
   initialTab?: 'agent' | 'runtime' | 'appearance';
+  /** Confirms with the user before an action that replaces the workspace (unsaved edits). */
+  guard?: (action: () => void) => void;
 };
 export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }: DialogProps) {
   const [settings, setSettings] = useState<Settings>(data.settings);
@@ -378,7 +380,7 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
   );
 }
 
-export function ConnectDialog({ open, onOpenChange, data, refresh }: DialogProps) {
+export function ConnectDialog({ open, onOpenChange, data, refresh, guard }: DialogProps) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profile, setProfile] = useState('');
   const [stores, setStores] = useState<Storefront[]>([]);
@@ -449,7 +451,13 @@ export function ConnectDialog({ open, onOpenChange, data, refresh }: DialogProps
       setBusy('');
     }
   }
-  async function connect() {
+  function connect() {
+    if (!selected) return;
+    const run = () => void doConnect();
+    if (guard) guard(run);
+    else run();
+  }
+  async function doConnect() {
     if (!selected) return;
     setBusy('connect');
     setError('');
@@ -599,15 +607,17 @@ export function ConnectDialog({ open, onOpenChange, data, refresh }: DialogProps
         <DialogFooter>
           <Button
             variant="ghost"
-            onClick={async () => {
-              try {
-                await invoke('workspace.sample');
-                await refresh();
-                onOpenChange(false);
-              } catch (error) {
-                toast.error(errorText(error));
-              }
-            }}
+            onClick={() =>
+              (guard || ((action: () => void) => action()))(async () => {
+                try {
+                  await invoke('workspace.sample');
+                  await refresh();
+                  onOpenChange(false);
+                } catch (error) {
+                  toast.error(errorText(error));
+                }
+              })
+            }
           >
             Use sample store
           </Button>
