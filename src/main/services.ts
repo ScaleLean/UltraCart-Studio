@@ -72,6 +72,7 @@ export class StudioServices {
   readonly widgetIds: WidgetIdsService;
   private publishBusy = new Set<string>();
   private reported = new Set<string>();
+  private nativeIdsBusy = new Map<string, symbol>();
   constructor(
     readonly store: Store,
     readonly emit: () => void,
@@ -304,7 +305,11 @@ export class StudioServices {
     this.emit();
     return draft;
   }
-  private assertEditable(id: string) {
+  private assertEditable(id: string, nativeIdsOwner?: symbol) {
+    if (this.nativeIdsBusy.has(id) && this.nativeIdsBusy.get(id) !== nativeIdsOwner)
+      throw new Error(
+        'Native widget IDs are being reserved. Wait for the reservation to finish before editing.'
+      );
     if (this.publishBusy.has(id))
       throw new Error('Publishing is in progress. Wait for verification before editing.');
     if (this.getChange(id).publishedAt)
@@ -339,28 +344,37 @@ export class StudioServices {
   async reserveNativeIds(scope: DraftScope, id: string, revision: number, confirmedHost: string) {
     this.assertEditable(id);
     const record = this.checkRecord(scope, id, revision);
+    // Edits to this draft are refused until the reserved IDs are written back, so a save cannot
+    // change the revision mid-allocation and strand the receipt.
+    const owner = Symbol(id);
     const assertCurrent = () => {
       if (!sameStore(this.workspace().selection, scope.selection))
         throw new Error(
           'The active storefront changed. Reserved IDs remain in the preparation receipt. Return to the original draft.'
         );
-      this.assertEditable(id);
+      this.assertEditable(id, owner);
       this.checkRecord(scope, id, revision);
     };
     assertCurrent();
-    const prepared = await new WidgetIdsService(this, { assertCurrent }).reserve({
-      selection: scope.selection,
-      content: record.content,
-      operationKey: `draft:${id}:revision:${revision}`,
-      confirmedHost,
-    });
-    assertCurrent();
-    const draft = this.remember(
-      await this.draftService(scope).updateContent(
-        { ...scope, id, revision, content: prepared.content },
-        assertCurrent
-      )
-    );
+    this.nativeIdsBusy.set(id, owner);
+    let draft: Draft, prepared: Awaited<ReturnType<WidgetIdsService['reserve']>>;
+    try {
+      prepared = await new WidgetIdsService(this, { assertCurrent }).reserve({
+        selection: scope.selection,
+        content: record.content,
+        operationKey: `draft:${id}:revision:${revision}`,
+        confirmedHost,
+      });
+      assertCurrent();
+      draft = this.remember(
+        await this.draftService(scope).updateContent(
+          { ...scope, id, revision, content: prepared.content },
+          assertCurrent
+        )
+      );
+    } finally {
+      this.nativeIdsBusy.delete(id);
+    }
     this.store.log(
       workspaceId(scope.selection),
       'draft',

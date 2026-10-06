@@ -224,7 +224,13 @@ export class LandingService {
           String(project.selection.storefront.id),
         ]);
         guard();
-        templates = parseLandingTemplates(JSON.parse(result), project.selection.storefront.id, themeId);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(result);
+        } catch {
+          throw new Error('The toolkit returned an unreadable template list. Refresh and try again.');
+        }
+        templates = parseLandingTemplates(parsed, project.selection.storefront.id, themeId);
         if (pages.some((page) => page.path === parentPath && page.catalogCopies === 1)) {
           parent = await this.services.connection.page(project.selection, parentPath);
           guard();
@@ -338,7 +344,6 @@ export class LandingService {
         operationKey: `landing:${project.id}:${project.revision}`,
         confirmedHost: value.confirmedHost,
       });
-      this.target(scope);
       if (
         result.receipt.status !== 'complete' ||
         result.receipt.contentHash !== record.view.sourceHash ||
@@ -354,6 +359,17 @@ export class LandingService {
         count: result.receipt.count,
         receiptId: result.receipt.id,
       };
+      record.view.validation = {
+        ...record.view.validation,
+        status: 'unavailable',
+        checkedAt: null,
+        report: null,
+        message: 'Native IDs were reserved. Prepare again to validate the prepared body.',
+      };
+      record.view.blockers = this.blockers(record.view);
+      // Keep the allocated IDs with the preparation even if the draft changed during allocation.
+      this.services.store.set(preparationKey(project.id), record);
+      this.target(scope);
       record.view.validation = await this.validatePrepared(result.content);
       this.target(scope);
       record.view.preparedAt = new Date().toISOString();
