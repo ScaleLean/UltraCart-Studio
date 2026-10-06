@@ -89,10 +89,12 @@ export function LandingStudio({
   boot,
   selectedId,
   onAgent,
+  onUnsavedChange,
 }: {
   boot: Bootstrap;
   selectedId?: string;
   onAgent?: (project: LandingProject, prompt: string) => void;
+  onUnsavedChange?: (dirty: boolean) => void;
 }) {
   const [projects, setProjects] = useState<LandingProject[]>([]);
   const [project, setProject] = useState<LandingProject | null>(null);
@@ -119,6 +121,12 @@ export function LandingStudio({
   const projectRef = useRef(project);
   projectRef.current = project;
   dirtyRef.current = dirty;
+  const reportUnsaved = useRef(onUnsavedChange);
+  reportUnsaved.current = onUnsavedChange;
+  useEffect(() => {
+    reportUnsaved.current?.(dirty);
+  }, [dirty]);
+  useEffect(() => () => reportUnsaved.current?.(false), []);
   const activeSection = draft?.sections.find((item) => item.id === sectionId) ?? draft?.sections[0];
   const scopedProjects = projects.filter((item) => item.workspaceId === boot.workspace.id);
 
