@@ -53,6 +53,13 @@ export type DraftToolkit = {
 export function draftHash(text: string) {
   return createHash('sha256').update(text).digest('hex');
 }
+export function parseJson(text: string, message: string): any {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(message);
+  }
+}
 export function containerPath(path: string, slot: string) {
   assertPagePath(path);
   if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(slot)) throw new Error('Use a simple container slot name.');

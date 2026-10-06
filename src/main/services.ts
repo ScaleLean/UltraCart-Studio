@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { ConnectionService } from './domain/connection-service';
-import { DraftService, draftHash, containerPath } from './domain/draft-service';
+import { DraftService, draftHash, containerPath, parseJson } from './domain/draft-service';
 import { draftSaveSchema, draftScopeSchema } from '../shared/drafts';
 import { readContentMap } from './content-map';
 import { WidgetIdsService } from './widget-ids';
@@ -612,19 +612,95 @@ export class StudioServices {
           '--live',
         ])
       );
-      return await this.verifyPublish(scope, id, revision);
+      const change = await this.settlePublish(scope, id, revision);
+      if (!change.publishedAt)
+        throw new Error('UltraCart left the live page unchanged. Publish again to retry.');
+      return change;
     } finally {
       this.publishBusy.delete(id);
     }
   }
   async verifyPublish(scope: DraftScope, id: string, revision: number) {
+    if (this.publishBusy.has(id)) throw new Error('Wait for the current operation to finish.');
+    return this.settlePublish(scope, id, revision);
+  }
+  private async settlePublish(scope: DraftScope, id: string, revision: number) {
     const record = this.checkRecord(scope, id, revision);
     const attempt = this.store.get<{ revision: number; hash: string } | null>(`publish-attempt:${id}`, null);
     if (!attempt || attempt.revision !== revision) throw new Error('No matching publish attempt to verify.');
     if (attempt.hash !== draftHash(record.content))
       throw new Error('The saved content no longer matches this publish attempt.');
+    const outcome = this.publishOutcome(record, (await this.pullRemote(scope, record)).content);
+    if (outcome === 'draft') {
+      this.store.set(`published:${id}`, { revision, at: new Date().toISOString() });
+      this.store.log(workspaceId(scope.selection), 'store', 'Published content verified', scope.path);
+    } else if (outcome === 'baseline') {
+      this.store.delete(`publish-attempt:${id}`);
+      this.store.log(
+        workspaceId(scope.selection),
+        'store',
+        'Publish not applied',
+        `${scope.path} · live page unchanged, publish can be retried`
+      );
+    } else
+      throw new Error(
+        'The live page matches neither this revision nor its baseline. Abandon the attempt to continue from the live content.'
+      );
+    this.emit();
+    return this.getChange(id);
+  }
+  async abandonPublish(scope: DraftScope, id: string, revision: number, confirmation = '') {
+    if (this.publishBusy.has(id)) throw new Error('Wait for the current operation to finish.');
+    const record = this.checkRecord(scope, id, revision);
+    const attempt = this.store.get<{ revision: number } | null>(`publish-attempt:${id}`, null);
+    if (!attempt || attempt.revision !== revision) throw new Error('No matching publish attempt to abandon.');
+    this.publishBusy.add(id);
+    try {
+      const remote = await this.pullRemote(scope, record);
+      const outcome = this.publishOutcome(record, remote.content);
+      if (outcome === 'draft')
+        throw new Error('The live page matches this revision. Verify the publish instead.');
+      if (outcome === 'baseline') {
+        this.store.delete(`publish-attempt:${id}`);
+        this.store.log(
+          workspaceId(scope.selection),
+          'store',
+          'Publish attempt abandoned',
+          `${scope.path} · live page unchanged`
+        );
+      } else {
+        if (confirmation !== scope.selection.storefront.host)
+          throw new Error(
+            'The live page matches neither this revision nor its baseline. Type the exact storefront host to replace the draft with the live content.'
+          );
+        this.checkRecord(scope, id, revision);
+        const draft = this.rebase(scope, id, record, remote);
+        this.store.log(
+          workspaceId(scope.selection),
+          'store',
+          'Publish attempt abandoned',
+          `${scope.path} · revision ${draft.revision} opened from the live page`
+        );
+      }
+      this.emit();
+      return this.getChange(id);
+    } finally {
+      this.publishBusy.delete(id);
+    }
+  }
+  private publishOutcome(record: Record, content: string) {
+    const actual = parseJson(
+      content,
+      'The live content could not be read. The publish outcome remains unresolved. Retry verification.'
+    );
+    // Compare document structure because the server may normalize whitespace.
+    if (isDeepStrictEqual(actual, JSON.parse(record.content))) return 'draft';
+    if (isDeepStrictEqual(actual, JSON.parse(record.baseline))) return 'baseline';
+    return 'neither';
+  }
+  private async pullRemote(scope: DraftScope, record: Record) {
     await this.connection.verify(scope.selection);
-    const actual = await this.withFiles(record, async (snapshot) => {
+    return this.withFiles(record, async (snapshot) => {
       const file = snapshot + '.remote.cjson';
       await this.connection.run([
         '--format',
@@ -639,17 +715,44 @@ export class StudioServices {
         '--out',
         file,
       ]);
-      return readFile(file, 'utf8');
+      if ((await stat(file)).size > 512 * 1024 || (await stat(file + '.sf.json')).size > 1024 * 1024 + 8192)
+        throw new Error('This container exceeds the draft size limit.');
+      const content = await readFile(file, 'utf8');
+      const baselineState = await readFile(file + '.sf.json', 'utf8');
+      const state = parseJson(baselineState, 'The remote baseline does not match this page and store.');
+      const hash = draftHash(content);
+      if (
+        state?.version !== 1 ||
+        state.merchant !== scope.selection.merchantId ||
+        state.storefront !== scope.selection.storefront.id ||
+        state.to !== containerPath(scope.path, scope.slot) ||
+        state.hash !== hash ||
+        state.content !== content
+      )
+        throw new Error('The remote baseline does not match this page and store.');
+      return { content, baseline: content, baselineState, baselineHash: hash };
     });
-    // Compare document structure because the server may normalize whitespace.
-    if (!isDeepStrictEqual(JSON.parse(actual), JSON.parse(record.content)))
-      throw new Error(
-        'Remote content does not match the requested revision. The publish outcome remains unresolved.'
-      );
-    this.store.set(`published:${id}`, { revision, at: new Date().toISOString() });
-    this.store.log(workspaceId(scope.selection), 'store', 'Published content verified', scope.path);
-    this.emit();
-    return this.getChange(id);
+  }
+  private rebase(
+    scope: DraftScope,
+    id: string,
+    record: Record,
+    remote: Pick<Record, 'content' | 'baseline' | 'baselineState' | 'baselineHash'>
+  ) {
+    const next = { ...record, ...remote, revision: record.revision + 1, updatedAt: new Date().toISOString() };
+    this.store.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.store.db
+        .prepare("UPDATE storefront_drafts SET record = ? WHERE json_extract(record, '$.id') = ?")
+        .run(JSON.stringify(next), id);
+      const draft = this.remember(this.drafts.read(scope)!);
+      this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(`publish-attempt:${id}`);
+      this.store.db.exec('COMMIT');
+      return draft;
+    } catch (error) {
+      this.store.db.exec('ROLLBACK');
+      throw error;
+    }
   }
   async nextDraft(scope: DraftScope, id: string, revision: number) {
     const record = this.checkRecord(scope, id, revision);
@@ -658,61 +761,17 @@ export class StudioServices {
     if (this.publishBusy.has(id)) throw new Error('Wait for the current operation to finish.');
     this.publishBusy.add(id);
     try {
-      await this.connection.verify(scope.selection);
-      const remote = await this.withFiles(record, async (snapshot) => {
-        const file = snapshot + '.remote.cjson';
-        await this.connection.run([
-          '--format',
-          'json',
-          '--profile',
-          scope.selection.profileId,
-          'sf',
-          'pull',
-          containerPath(scope.path, scope.slot),
-          '--storefront',
-          String(scope.selection.storefront.id),
-          '--out',
-          file,
-        ]);
-        if ((await stat(file)).size > 512 * 1024 || (await stat(file + '.sf.json')).size > 1024 * 1024 + 8192)
-          throw new Error('This container exceeds the draft size limit.');
-        const content = await readFile(file, 'utf8');
-        const baselineState = await readFile(file + '.sf.json', 'utf8');
-        const state = JSON.parse(baselineState);
-        const hash = draftHash(content);
-        if (
-          state.version !== 1 ||
-          state.merchant !== scope.selection.merchantId ||
-          state.storefront !== scope.selection.storefront.id ||
-          state.to !== containerPath(scope.path, scope.slot) ||
-          state.hash !== hash ||
-          state.content !== content
-        )
-          throw new Error('The remote baseline does not match this page and store.');
-        return { content, baseline: content, baselineState, baselineHash: hash };
-      });
+      const remote = await this.pullRemote(scope, record);
       this.checkRecord(scope, id, revision);
-      const next = { ...record, ...remote, revision: revision + 1, updatedAt: new Date().toISOString() };
-      this.store.db.exec('BEGIN IMMEDIATE');
-      try {
-        this.store.db
-          .prepare("UPDATE storefront_drafts SET record = ? WHERE json_extract(record, '$.id') = ?")
-          .run(JSON.stringify(next), id);
-        const draft = this.remember(this.drafts.read(scope)!);
-        this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(`publish-attempt:${id}`);
-        this.store.db.exec('COMMIT');
-        this.store.log(
-          workspaceId(scope.selection),
-          'draft',
-          'New baseline opened',
-          `${scope.path} · revision ${draft.revision}`
-        );
-        this.emit();
-        return draft;
-      } catch (error) {
-        this.store.db.exec('ROLLBACK');
-        throw error;
-      }
+      const draft = this.rebase(scope, id, record, remote);
+      this.store.log(
+        workspaceId(scope.selection),
+        'draft',
+        'New baseline opened',
+        `${scope.path} · revision ${draft.revision}`
+      );
+      this.emit();
+      return draft;
     } finally {
       this.publishBusy.delete(id);
     }

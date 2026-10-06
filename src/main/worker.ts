@@ -223,6 +223,10 @@ async function dispatch(method: string, input: any) {
       const v = draftSchema.parse(input);
       return services.verifyPublish(services.scope(v.path, v.slot), v.id, v.revision);
     }
+    case 'draft.abandon': {
+      const v = draftSchema.extend({ confirmation: z.string().max(253).optional() }).parse(input);
+      return services.abandonPublish(services.scope(v.path, v.slot), v.id, v.revision, v.confirmation);
+    }
     case 'draft.next': {
       const v = draftSchema.parse(input);
       return services.nextDraft(services.scope(v.path, v.slot), v.id, v.revision);

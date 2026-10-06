@@ -38,6 +38,9 @@ export class Store {
       )
       .run(key, JSON.stringify(value));
   }
+  delete(key: string) {
+    this.db.prepare('DELETE FROM kv WHERE key = ?').run(key);
+  }
   session(id: string): Session {
     const row = this.db.prepare('SELECT value FROM sessions WHERE id = ?').get(id) as
       { value: string } | undefined;
