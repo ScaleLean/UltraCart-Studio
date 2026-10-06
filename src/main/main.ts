@@ -24,9 +24,9 @@ if (process.env.UC_STUDIO_DATA) {
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   app.setPath('userData', profile);
 }
-const development = !!process.env.UC_STUDIO_DEV;
-const root =
-  process.env.UC_STUDIO_ROOT || (app.isPackaged ? process.resourcesPath : resolve(__dirname, '..'));
+// Developer overrides are ignored in packaged builds so a local process cannot redirect the bridge window or the toolkit root.
+const development = !app.isPackaged && !!process.env.UC_STUDIO_DEV;
+const root = app.isPackaged ? process.resourcesPath : process.env.UC_STUDIO_ROOT || resolve(__dirname, '..');
 const directory = process.env.UC_STUDIO_DATA || app.getPath('userData');
 let win: BrowserWindow;
 let worker: UtilityProcess | null = null;
