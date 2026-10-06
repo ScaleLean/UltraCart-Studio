@@ -325,6 +325,52 @@ async function liveDraft(f: Awaited<ReturnType<typeof fixture>>) {
   return { workspace, scope, draft, content, baseline };
 }
 
+test('draft saves are refused while native IDs are being reserved', async (t) => {
+  const f = await fixture();
+  try {
+    const { scope, draft } = await liveDraft(f);
+    const actualReserve = WidgetIdsService.prototype.reserve;
+    t.mock.method(WidgetIdsService.prototype, 'reserve', function (this: WidgetIdsService, raw: unknown) {
+      const assertCurrent = Reflect.get(this, 'options').assertCurrent as () => void;
+      return actualReserve.call(new WidgetIdsService(f.services, { ...f.options, assertCurrent }), raw);
+    });
+    const allocate = f.transport.reserve;
+    let saveError: unknown;
+    f.transport.reserve = async (selection, count) => {
+      const receipt = await allocate(selection, count);
+      await f.services
+        .save({
+          ...scope,
+          id: draft.id,
+          revision: draft.revision,
+          edits: [{ pointer: draft.fields[0].pointer, value: 'A newer user edit' }],
+        })
+        .catch((error) => (saveError = error));
+      return receipt;
+    };
+    const result = await f.services.reserveNativeIds(
+      scope,
+      draft.id,
+      draft.revision,
+      selection.storefront.host
+    );
+    assert.match(String(saveError), /being reserved/);
+    assert.equal(result.receipt.status, 'complete');
+    assert.equal(result.draft.revision, draft.revision + 1);
+    assert.equal(result.draft.localWidgetCount, 0);
+    assert.equal(f.allocations.length, 1);
+    const saved = await f.services.save({
+      ...scope,
+      id: draft.id,
+      revision: result.draft.revision,
+      edits: [{ pointer: result.draft.fields[0].pointer, value: 'An edit after reservation' }],
+    });
+    assert.equal(saved.revision, result.draft.revision + 1);
+  } finally {
+    await f.close();
+  }
+});
+
 test('a stale draft edit after allocation retains the receipt without overwriting newer content', async (t) => {
   const f = await fixture();
   try {
@@ -337,7 +383,8 @@ test('a stale draft edit after allocation retains the receipt without overwritin
     const allocate = f.transport.reserve;
     f.transport.reserve = async (selection, count) => {
       const receipt = await allocate(selection, count);
-      await f.services.save({
+      // Another window writes the draft directly, outside this service's edit guard.
+      await f.services.drafts.update({
         ...scope,
         id: draft.id,
         revision: draft.revision,
@@ -397,6 +444,148 @@ test('a workspace switch after allocation preserves the receipt and recovers wit
     assert.equal(recovered.draft.revision, draft.revision + 1);
     assert.equal(recovered.draft.localWidgetCount, 0);
     assert.equal(f.allocations.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+function storeReceipt(f: Awaited<ReturnType<typeof fixture>>, operationKey: string, value: string) {
+  f.store.db
+    .prepare(
+      'INSERT INTO widget_id_operations (operation_key, value) VALUES (?, ?) ON CONFLICT(operation_key) DO UPDATE SET value = excluded.value'
+    )
+    .run(operationKey, value);
+}
+
+test('reservations without an injected transport use the shared toolkit connection', async () => {
+  const f = await fixture();
+  try {
+    const commands: string[][] = [];
+    let verified = 0;
+    f.services.connection.verify = async (input) => {
+      assert.deepEqual(input, selection);
+      verified++;
+      return selection.storefront;
+    };
+    f.services.connection.run = async (args) => {
+      commands.push(args);
+      const count = Number(args[args.indexOf('--count') + 1]);
+      return JSON.stringify({ ids: Array.from({ length: count }, (_, index) => 500 + index), count });
+    };
+    const result = await new WidgetIdsService(f.services, { schemaFor: f.options.schemaFor }).reserve(
+      confirmed()
+    );
+    assert.equal(result.receipt.status, 'complete');
+    assert.equal(commands.length, 1);
+    assert.deepEqual(commands[0].slice(-6), ['sf', 'ids', '--storefront', '42', '--count', '2']);
+    assert.equal(verified, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a preparation interrupted before any batch was recorded can be retried', async () => {
+  const f = await fixture();
+  try {
+    const plan = f.ids.inspect(input());
+    const now = new Date().toISOString();
+    storeReceipt(
+      f,
+      'draft:test:1',
+      JSON.stringify({
+        id: 'crashed-attempt',
+        operationKey: 'draft:test:1',
+        selection,
+        contentHash: plan.contentHash,
+        count: plan.count,
+        status: 'preparing',
+        createdAt: now,
+        updatedAt: now,
+        batches: [],
+        mapping: {},
+        provenance: 'test',
+      })
+    );
+    const recovered = f.ids.inspect(input());
+    assert.equal(recovered.canReserve, true);
+    assert.equal(recovered.receipt!.status, 'blocked');
+    assert.match(recovered.receipt!.detail!, /before any allocation request/);
+    const result = await new WidgetIdsService(f.services, f.options).reserve(confirmed());
+    assert.equal(result.receipt.status, 'complete');
+    assert.notEqual(result.receipt.id, 'crashed-attempt');
+    assert.deepEqual(f.allocations, [2]);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a preparation that recorded a batch stays locked after an interruption', async () => {
+  const f = await fixture();
+  try {
+    const plan = f.ids.inspect(input());
+    const now = new Date().toISOString();
+    storeReceipt(
+      f,
+      'draft:test:1',
+      JSON.stringify({
+        id: 'crashed-attempt',
+        operationKey: 'draft:test:1',
+        selection,
+        contentHash: plan.contentHash,
+        count: plan.count,
+        status: 'preparing',
+        createdAt: now,
+        updatedAt: now,
+        batches: [{ index: 0, count: 2, status: 'started', startedAt: now }],
+        mapping: {},
+        provenance: 'test',
+      })
+    );
+    assert.equal(f.ids.inspect(input()).canReserve, false);
+    await assert.rejects(f.ids.reserve(confirmed()), /automatic retry is disabled/);
+    assert.equal(f.allocations.length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a running preparation is not retryable, and a takeover stops the earlier attempt before allocation', async () => {
+  const f = await fixture();
+  try {
+    const verify = f.transport.verify;
+    let checked = false;
+    f.transport.verify = async (input) => {
+      if (!checked) {
+        checked = true;
+        const plan = f.ids.inspect({ selection, content: document(), operationKey: 'draft:test:1' });
+        assert.equal(plan.canReserve, false);
+        assert.match(plan.reason!, /already running/);
+        assert.equal(plan.receipt!.status, 'preparing');
+        // Simulate another Studio process recovering the same key while this attempt waits.
+        const receipt = { ...plan.receipt!, id: 'other-process', status: 'preparing' as const };
+        storeReceipt(f, 'draft:test:1', JSON.stringify(receipt));
+      }
+      return verify(input);
+    };
+    await assert.rejects(f.ids.reserve(confirmed()), /took over this preparation/);
+    assert.equal(f.allocations.length, 0);
+    assert.equal(f.ids.inspect(input()).receipt!.id, 'other-process');
+  } finally {
+    await f.close();
+  }
+});
+
+test('damaged receipts are reported for their own key and skipped in cross-receipt scans', async () => {
+  const f = await fixture();
+  try {
+    storeReceipt(f, 'draft:other:1', '{not json');
+    storeReceipt(f, 'draft:partial:1', JSON.stringify({ selection: null, batches: [{}] }));
+    const result = await f.ids.reserve(confirmed());
+    assert.equal(result.receipt.status, 'complete');
+    storeReceipt(f, 'draft:test:2', '{not json');
+    assert.throws(() => f.ids.inspect(input(document(), 'draft:test:2')), /receipt is damaged/);
+    await assert.rejects(f.ids.reserve(confirmed(document(), 'draft:test:2')), /receipt is damaged/);
+    assert.deepEqual(f.allocations, [2]);
   } finally {
     await f.close();
   }

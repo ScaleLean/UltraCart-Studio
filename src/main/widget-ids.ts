@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
-import { ConnectionService } from './domain/connection-service';
 import type { StudioServices } from './services';
 import { selectionSchema, type Selection } from '../shared/connection';
 import { sameStore } from '../shared/storefront';
@@ -34,6 +33,10 @@ const pointer = (key: string) => key.replace(/~/g, '~0').replace(/\//g, '~1');
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 type References = { ids: Set<string>; css: Set<string> };
+// Reservations running in this process, keyed by database so that every service instance sees them.
+const running = new WeakMap<object, Set<string>>();
+const interrupted =
+  'Studio stopped before any allocation request was sent. No IDs were reserved; you can retry.';
 export type WidgetIdTransport = {
   verify(selection: Selection): Promise<unknown>;
   reserve(selection: Selection, count: number): Promise<unknown>;
@@ -201,6 +204,14 @@ function remap(root: CjsonNode, mapping: Map<string, string>, references: Map<st
   return serializePageDocument(result);
 }
 
+class Superseded extends Error {
+  constructor() {
+    super(
+      'Another reservation took over this preparation before any IDs were requested. Reopen its receipt.'
+    );
+  }
+}
+
 export class WidgetIdsService {
   private now: () => Date;
   constructor(
@@ -212,17 +223,39 @@ export class WidgetIdsService {
       'CREATE TABLE IF NOT EXISTS widget_id_operations (operation_key TEXT PRIMARY KEY, value TEXT NOT NULL)'
     );
   }
+  private get running() {
+    const db = this.services.store.db;
+    let keys = running.get(db);
+    if (!keys) running.set(db, (keys = new Set()));
+    return keys;
+  }
   private saved(operationKey: string) {
     const row = this.services.store.db
       .prepare('SELECT value FROM widget_id_operations WHERE operation_key = ?')
       .get(operationKey);
-    return row ? (JSON.parse(row.value as string) as WidgetIdReceipt) : null;
+    if (!row) return null;
+    let receipt: WidgetIdReceipt;
+    try {
+      receipt = JSON.parse(row.value as string) as WidgetIdReceipt;
+    } catch {
+      throw new Error('The stored preparation receipt is damaged.');
+    }
+    if (!object(receipt) || !Array.isArray(receipt.batches))
+      throw new Error('The stored preparation receipt is damaged.');
+    // A batch is recorded before every allocation request, so an interrupted preparation with no
+    // batches never reached the toolkit. Unless it is still running here, it is safe to retry.
+    if (receipt.status === 'preparing' && !receipt.batches.length && !this.running.has(operationKey))
+      return { ...receipt, status: 'blocked' as const, detail: interrupted };
+    return receipt;
   }
   private persist(receipt: WidgetIdReceipt) {
     receipt.updatedAt = this.now().toISOString();
-    this.services.store.db
-      .prepare('UPDATE widget_id_operations SET value = ? WHERE operation_key = ?')
-      .run(JSON.stringify(receipt), receipt.operationKey);
+    const result = this.services.store.db
+      .prepare(
+        "UPDATE widget_id_operations SET value = ? WHERE operation_key = ? AND json_extract(value, '$.id') = ?"
+      )
+      .run(JSON.stringify(receipt), receipt.operationKey, receipt.id);
+    if (!result.changes) throw new Superseded();
   }
   inspect(raw: unknown): WidgetIdPlan {
     const input = inputSchema.parse(raw);
@@ -235,11 +268,13 @@ export class WidgetIdsService {
       throw new Error('This preparation key belongs to different content or a different storefront.');
     const reason = isSampleSelection(input.selection)
       ? 'Sample pages use local IDs and do not reserve server IDs.'
-      : receipt && !['blocked', 'complete'].includes(receipt.status)
-        ? 'An earlier allocation may have completed. Its receipt is retained; automatic retry is disabled.'
-        : count === 0
-          ? 'This document has no new local widget IDs.'
-          : undefined;
+      : receipt?.status === 'preparing' && this.running.has(input.operationKey)
+        ? 'A reservation for this preparation is already running.'
+        : receipt && !['blocked', 'complete'].includes(receipt.status)
+          ? 'An earlier allocation may have completed. Its receipt is retained; automatic retry is disabled.'
+          : count === 0
+            ? 'This document has no new local widget IDs.'
+            : undefined;
     return {
       operationKey: input.operationKey,
       contentHash,
@@ -346,14 +381,15 @@ export class WidgetIdsService {
       db.exec('ROLLBACK');
       throw error;
     }
-    const connection = this.options.transport
-      ? null
-      : new ConnectionService(async () => ({ nodePath: settings.nodePath, cliPath: settings.cliPath }));
+    const running = this.running;
+    running.add(input.operationKey);
+    // Use the shared connection so reservations queue behind publishes and respect the login guard.
+    const connection = this.services.connection;
     const transport = this.options.transport ?? {
-      verify: (selection: Selection) => connection!.verify(selection),
+      verify: (selection: Selection) => connection.verify(selection),
       reserve: async (selection: Selection, count: number) =>
         JSON.parse(
-          await connection!.run([
+          await connection.run([
             '--format',
             'json',
             '--profile',
@@ -410,12 +446,21 @@ export class WidgetIdsService {
           throw new Error('The returned IDs are duplicated or collide with existing widgets.');
         for (const row of db.prepare('SELECT operation_key, value FROM widget_id_operations').all()) {
           if (row.operation_key === input.operationKey) continue;
-          const old = JSON.parse(row.value as string) as WidgetIdReceipt;
+          let old: Partial<WidgetIdReceipt>;
+          try {
+            old = JSON.parse(row.value as string);
+          } catch {
+            continue;
+          }
           if (
-            old.selection.merchantId === input.selection.merchantId &&
-            old.selection.storefront.id === input.selection.storefront.id &&
+            object(old) &&
+            old.selection?.merchantId === input.selection.merchantId &&
+            old.selection.storefront?.id === input.selection.storefront.id &&
             old.selection.storefront.host === input.selection.storefront.host &&
-            old.batches.some((item) => item.ids?.some((id) => ids.includes(id)))
+            Array.isArray(old.batches) &&
+            old.batches.some(
+              (item) => Array.isArray(item?.ids) && item.ids.some((id: unknown) => ids.includes(id as number))
+            )
           )
             throw new Error('The returned IDs already appear in another preparation receipt.');
         }
@@ -440,14 +485,19 @@ export class WidgetIdsService {
       this.persist(receipt);
       return { content, receipt };
     } catch (error) {
+      if (error instanceof Superseded) throw error;
       receipt.status = receipt.batches.length ? 'uncertain' : 'blocked';
       receipt.detail = receipt.batches.length
         ? 'An allocation may have completed. Do not repeat it. Review the persisted batch receipt.'
         : 'Preflight identity verification failed before any allocation request.';
-      this.persist(receipt);
+      try {
+        this.persist(receipt);
+      } catch (persistError) {
+        if (!(persistError instanceof Superseded)) throw persistError;
+      }
       throw error;
     } finally {
-      connection?.dispose();
+      running.delete(input.operationKey);
     }
   }
 }
