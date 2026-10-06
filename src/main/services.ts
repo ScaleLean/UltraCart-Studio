@@ -107,20 +107,31 @@ export class StudioServices {
       previousWorkspace.id !== workspaceId(previousWorkspace.selection)
     ) {
       const id = workspaceId(previousWorkspace.selection);
-      store.set(`pages:${id}`, store.get(`pages:${previousWorkspace.id}`, []));
-      store.set('workspace', { ...previousWorkspace, id });
-      const sessions = store.db
-        .prepare('SELECT value FROM sessions WHERE workspace_id = ?')
-        .all(previousWorkspace.id);
-      for (const row of sessions) {
-        const session = JSON.parse(row.value as string);
-        store.saveSession({ ...session, workspaceId: workspaceId(session.scope.selection) });
+      store.db.exec('BEGIN IMMEDIATE');
+      try {
+        store.set(`pages:${id}`, store.get(`pages:${previousWorkspace.id}`, []));
+        store.set('workspace', { ...previousWorkspace, id });
+        const sessions = store.db
+          .prepare('SELECT id, value FROM sessions WHERE workspace_id = ?')
+          .all(previousWorkspace.id);
+        for (const row of sessions) {
+          try {
+            const session = JSON.parse(row.value as string);
+            store.saveSession({ ...session, workspaceId: workspaceId(session.scope.selection) });
+          } catch {
+            console.error(`Skipped an unreadable conversation during workspace migration: ${row.id}`);
+          }
+        }
+        store.db
+          .prepare(
+            "UPDATE activity SET workspace_id = ?, value = json_set(value, '$.workspaceId', ?) WHERE workspace_id = ? AND json_valid(value)"
+          )
+          .run(id, id, previousWorkspace.id);
+        store.db.exec('COMMIT');
+      } catch (error) {
+        store.db.exec('ROLLBACK');
+        throw error;
       }
-      store.db
-        .prepare(
-          "UPDATE activity SET workspace_id = ?, value = json_set(value, '$.workspaceId', ?) WHERE workspace_id = ?"
-        )
-        .run(id, id, previousWorkspace.id);
     }
     this.connection = new ConnectionService(async () => this.settings());
     const snapshot = (record: Record, draft: Draft) => this.snapshot(record, draft);
