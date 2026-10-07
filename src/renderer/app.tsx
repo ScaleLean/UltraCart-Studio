@@ -113,6 +113,8 @@ export function App() {
   const featureSequence = useRef(0);
   const unsaved = useRef(new Set<Screen>());
   const [discard, setDiscard] = useState<{ action: () => void } | null>(null);
+  // Bumped when the user confirms a discard, so editors remount even if the workspace did not change.
+  const [discardEpoch, setDiscardEpoch] = useState(0);
   const reportUnsaved = useCallback((source: Screen, dirty: boolean) => {
     if (dirty) unsaved.current.add(source);
     else unsaved.current.delete(source);
@@ -611,7 +613,7 @@ export function App() {
         )}
         {screen === 'landing' && (
           <LandingStudio
-            key={data.workspace.id}
+            key={`${data.workspace.id}:${discardEpoch}`}
             boot={data}
             selectedId={selectedLandingId}
             onAgent={openLandingAgent}
@@ -734,6 +736,7 @@ export function App() {
                 const action = discard?.action;
                 setDiscard(null);
                 unsaved.current.clear();
+                setDiscardEpoch((n) => n + 1);
                 action?.();
               }}
             >

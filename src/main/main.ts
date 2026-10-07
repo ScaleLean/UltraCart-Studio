@@ -624,15 +624,22 @@ async function confirmQuit() {
   }
 }
 async function askQuit() {
-  let unsaved = false;
+  let unsaved: unknown = false;
   try {
     // A hung renderer must not block quitting, so an unanswered check counts as no unsaved edits.
-    unsaved = !!(await Promise.race([
+    unsaved = await Promise.race([
       win.webContents.executeJavaScript('window.__studioHasUnsaved?.() === true'),
-      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
-    ]));
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 2000)),
+    ]);
   } catch {}
-  if (unsaved) {
+  // A hung renderer would also never answer the unload, so close its window without asking.
+  if (unsaved === 'timeout') {
+    quitConfirmed = true;
+    win.destroy();
+    app.quit();
+    return;
+  }
+  if (unsaved === true) {
     win.show();
     const { response } = await dialog.showMessageBox(win, {
       type: 'warning',
@@ -656,6 +663,10 @@ app.on('before-quit', (event) => {
   if (!quitting) {
     quitting = true;
     closePreview();
+    // Last resort if the renderer hangs during the unload after a confirmed quit.
+    setTimeout(() => {
+      if (win && !win.isDestroyed()) win.destroy();
+    }, 5000).unref();
     if (!worker) return;
     event.preventDefault();
     void stopWorker().finally(() => {
