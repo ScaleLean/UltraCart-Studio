@@ -57,6 +57,21 @@ test('moving the app preserves configured toolkit paths when the new app has no 
     await f.cleanup();
   }
 });
+test('executable paths change only through savePath and must be absolute', async () => {
+  const f = await fixture();
+  try {
+    const before = f.service.settings();
+    const picked = join(f.directory, 'node');
+    const next = f.service.savePath('nodePath', picked);
+    assert.equal(next.nodePath, picked);
+    assert.equal(next.cliPath, before.cliPath);
+    assert.equal(f.service.settings().nodePath, picked);
+    assert.throws(() => f.service.savePath('cliPath', 'relative/bin.js'));
+    assert.equal(f.service.settings().cliPath, before.cliPath);
+  } finally {
+    await f.cleanup();
+  }
+});
 test('sample drafts persist, invalidate reviews, and restore as a new revision', async () => {
   const f = await fixture();
   try {
@@ -73,7 +88,8 @@ test('sample drafts persist, invalidate reviews, and restore as a new revision',
     const review = await f.service.review(scope, edited.id, edited.revision);
     assert.equal(review.validation.valid, true);
     assert.equal(f.service.getChange(edited.id).status, 'reviewed');
-    const restored = await f.service.restore(scope, edited.id, 1);
+    await assert.rejects(f.service.restore(scope, edited.id, 1, 1), /changed in another window/);
+    const restored = await f.service.restore(scope, edited.id, 1, edited.revision);
     assert.equal(restored.revision, 3);
     assert.equal(restored.changedFields, 0);
     assert.equal(f.service.getChange(edited.id).review, null);
@@ -108,6 +124,39 @@ test('stale revisions and mismatched page scopes cannot overwrite drafts', async
     assert.throws(() => f.service.scope('/not-in-catalog/'), /Select a page/);
     assert.throws(() => f.service.scope('/../'), /Invalid page path/);
   } finally {
+    await f.cleanup();
+  }
+});
+test('unreadable stored rows are skipped or reported without crashing the workspace', async () => {
+  const f = await fixture();
+  const error = console.error;
+  console.error = () => {};
+  try {
+    const scope = f.service.scope('/');
+    const draft = await f.service.pull(scope);
+    f.store.db.prepare('INSERT INTO storefront_drafts (scope_key, record) VALUES (?, ?)').run('broken', '{');
+    f.store.db
+      .prepare('INSERT INTO activity (id, workspace_id, at, value) VALUES (?, ?, ?, ?)')
+      .run('broken', f.service.workspace().id, '9999', '{');
+    f.store.db
+      .prepare('INSERT INTO sessions (id, workspace_id, updated_at, value) VALUES (?, ?, ?, ?)')
+      .run('broken', f.service.workspace().id, '9999', '{');
+    assert.deepEqual(
+      f.service.changes().map((c) => c.id),
+      [draft.id]
+    );
+    assert(f.store.activity(f.service.workspace().id).length > 0);
+    assert.deepEqual(f.store.sessions(f.service.workspace().id), []);
+    assert.deepEqual(f.store.pendingSessions(), []);
+    assert.throws(() => f.store.session('broken'), /conversation is unreadable/);
+    f.store.db.prepare('UPDATE revisions SET value = ? WHERE draft_id = ?').run('{', draft.id);
+    assert.throws(() => f.service.history(draft.id), /Revision 1 is unreadable/);
+    await assert.rejects(f.service.restore(scope, draft.id, 1, 1), /revision is unreadable/);
+    f.store.db.prepare('INSERT INTO kv (key, value) VALUES (?, ?)').run(`publish-attempt:${draft.id}`, '{');
+    assert.throws(() => f.service.getChange(draft.id), /publish-attempt data is unreadable/);
+    assert.deepEqual(f.service.changes(), []);
+  } finally {
+    console.error = error;
     await f.cleanup();
   }
 });

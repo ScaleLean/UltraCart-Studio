@@ -1,5 +1,7 @@
 export const WAREHOUSE_MAX_BYTES = 20 * 1024 ** 3;
 export const WAREHOUSE_DEFAULT_BYTES = 1024 ** 3;
+/** BigQuery bills at least 10 MiB per query, so a lower ceiling would pass the dry run and always fail. */
+export const WAREHOUSE_MIN_BYTES = 10 * 1024 ** 2;
 export type WarehouseQuery = { sql: string; rowLimit: number; maxBytes: number };
 export type WarehouseConfig = { bqPath: string; maxBytes: number };
 export type WarehouseIssueCode =
@@ -50,6 +52,10 @@ export function warehouseAbsolutePath(value: string) {
     !/[\u0000-\u001f\u007f]/.test(value) &&
     (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+[\\/]/.test(value))
   );
+}
+/** A full path whose file name is the BigQuery CLI launcher: bq, bq.cmd or bq.exe, in any case. */
+export function warehouseBqPath(value: string) {
+  return warehouseAbsolutePath(value) && /(?:^|[\\/])bq(?:\.cmd|\.exe)?$/i.test(value);
 }
 export type WarehouseTable = { name: string; type: string; description?: string };
 export type WarehouseField = { path: string; type: string; mode: string; description?: string };

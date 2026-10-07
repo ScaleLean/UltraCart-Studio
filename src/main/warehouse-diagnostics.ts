@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
+import { ConnectionService } from './domain/connection-service';
 import type { WarehouseIssue, WarehouseIssueCode } from '../shared/warehouse';
 
 const documentation = {
@@ -366,17 +367,26 @@ export const runWarehouseCommand: WarehouseRunner = (command, args) =>
     const child = spawn(launch.command, launch.args, {
       shell: false,
       windowsHide: true,
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: launch.env,
     });
-    let stdout = '',
+    const pid = child.pid;
+    if (pid) {
+      ConnectionService.childObserver?.(pid, 'started');
+      child.once('exit', () => ConnectionService.childObserver?.(pid, 'exited'));
+    }
+    // Collect raw bytes and decode once, so a UTF-8 character split across chunks stays intact.
+    const stdoutChunks: Buffer[] = [];
+    let stdoutBytes = 0,
       stderr = '',
       settled = false;
+    const stdout = () => Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8');
     const finish = (issue?: WarehouseIssue) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      issue ? reject(new WarehouseCliError(issue)) : resolve(stdout);
+      issue ? reject(new WarehouseCliError(issue)) : resolve(stdout());
     };
     const timer = setTimeout(
       () => {
@@ -385,9 +395,11 @@ export const runWarehouseCommand: WarehouseRunner = (command, args) =>
       },
       args.includes('version') || args.includes('auth') ? 20_000 : args.includes('query') ? 90_000 : 60_000
     );
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk;
-      if (Buffer.byteLength(stdout) > 4 * 1024 ** 2) {
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      stdoutChunks.push(chunk);
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > 4 * 1024 ** 2) {
         child.kill();
         finish(warehouseIssue('output_limit'));
       }
@@ -397,6 +409,6 @@ export const runWarehouseCommand: WarehouseRunner = (command, args) =>
     });
     child.on('error', (error: NodeJS.ErrnoException) => finish(classifyWarehouseFailure('', error.code)));
     child.on('close', (code) =>
-      finish(code === 0 ? undefined : classifyWarehouseFailure(stderr + '\n' + stdout))
+      finish(code === 0 ? undefined : classifyWarehouseFailure(stderr + '\n' + stdout()))
     );
   });

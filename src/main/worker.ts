@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { version } from '../../package.json';
 import { Store } from './database';
 import { StudioServices } from './services';
+import { ConnectionService } from './domain/connection-service';
 import { Auth, LocalCredentials } from './auth';
 import { Agents } from './agent';
 import { PageBuilderService } from './page-builder';
@@ -30,6 +31,7 @@ function host(method: string, params: unknown): Promise<any> {
     port.postMessage({ host: true, id, method, params });
   });
 }
+ConnectionService.childObserver = (pid, state) => port.postMessage({ child: { pid, state } });
 const pathSchema = z.object({ path: z.string().min(1).max(2048), slot: draftScopeSchema.shape.slot });
 const inputScope = (input: unknown) => {
   const v = pathSchema.parse(input);
@@ -86,6 +88,16 @@ async function dispatch(method: string, input: any) {
       const settings = services.saveSettings(input);
       emit({ type: 'auth', status: await auth.status() });
       return settings;
+    }
+    // Host-only methods: main calls these after a native file dialog. They are not in the public allowlist.
+    case 'settings.current':
+      return services.settings();
+    case 'settings.setPath': {
+      const v = z
+        .object({ kind: z.enum(['nodePath', 'cliPath']), path: z.string() })
+        .strict()
+        .parse(input);
+      return services.savePath(v.kind, v.path);
     }
     case 'workspace.refresh':
       return services.refresh();
@@ -162,6 +174,9 @@ async function dispatch(method: string, input: any) {
       return warehouse.status(input);
     case 'warehouse.configure':
       return warehouse.configure(input);
+    // Host-only: main calls this after a native file dialog. It is not in the public allowlist.
+    case 'warehouse.setBqPath':
+      return warehouse.setBqPath(input);
     case 'warehouse.tables':
       return warehouse.tables(input);
     case 'warehouse.schema':
@@ -208,8 +223,8 @@ async function dispatch(method: string, input: any) {
       return services.history(v.id);
     }
     case 'draft.restore': {
-      const v = draftSchema.parse(input);
-      return services.restore(services.scope(v.path, v.slot), v.id, v.revision);
+      const v = draftSchema.extend({ expectedRevision: z.number().int().positive() }).parse(input);
+      return services.restore(services.scope(v.path, v.slot), v.id, v.revision, v.expectedRevision);
     }
     case 'draft.export': {
       const v = draftSchema.parse(input);
@@ -222,6 +237,10 @@ async function dispatch(method: string, input: any) {
     case 'draft.verify': {
       const v = draftSchema.parse(input);
       return services.verifyPublish(services.scope(v.path, v.slot), v.id, v.revision);
+    }
+    case 'draft.abandon': {
+      const v = draftSchema.extend({ confirmation: z.string().max(253).optional() }).parse(input);
+      return services.abandonPublish(services.scope(v.path, v.slot), v.id, v.revision, v.confirmation);
     }
     case 'draft.next': {
       const v = draftSchema.parse(input);

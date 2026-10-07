@@ -1,4 +1,5 @@
 import packager from '@electron/packager';
+import { flipFuses, FuseV1Options, FuseVersion } from '@electron/fuses';
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
 import { chmod, copyFile, readFile, rm, writeFile } from 'node:fs/promises';
@@ -57,6 +58,20 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`${command} exited with ${result.status ?? result.signal}.`);
 }
 for (const directory of paths) {
+  // The asar archive is mandatory (asar: true above), so asar-only loading and integrity are safe to enforce.
+  const executable =
+    platform === 'darwin'
+      ? join(directory, 'UltraCart Studio.app')
+      : join(directory, platform === 'win32' ? 'UltraCart Studio.exe' : 'ultracart-studio');
+  await flipFuses(executable, {
+    version: FuseVersion.V1,
+    resetAdHocDarwinSignature: platform === 'darwin' && arch === 'arm64',
+    [FuseV1Options.RunAsNode]: false,
+    [FuseV1Options.EnableNodeOptionsEnvironmentVariable]: false,
+    [FuseV1Options.EnableNodeCliInspectArguments]: false,
+    [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: true,
+    [FuseV1Options.OnlyLoadAppFromAsar]: true,
+  });
   const resources =
     platform === 'darwin'
       ? join(directory, 'UltraCart Studio.app/Contents/Resources')

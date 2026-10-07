@@ -84,7 +84,7 @@ test('a queued structural edit stops if publishing starts before its turn', asyn
     await assert.rejects(queued, /needs verification/);
     assert.equal(services.getChange(draft.id).draft.revision, 1);
     assert.equal(services.history(draft.id).length, 1);
-    await assert.rejects(services.restore(scope, draft.id, 1), /needs verification/);
+    await assert.rejects(services.restore(scope, draft.id, 1, 1), /needs verification/);
   } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });
@@ -282,7 +282,7 @@ test('structural draft revisions enforce scope/CAS and preserve the immutable ba
     });
     assert.equal(moved.draft.revision, 3);
     assert.equal(services.getChange(draft.id).review, null);
-    const restored = await services.restore(scope, draft.id, 1);
+    const restored = await services.restore(scope, draft.id, 1, 3);
     assert.equal(restored.revision, 4);
     assert.equal(restored.localWidgetCount, 0);
     assert.deepEqual(restored.structureChanges, []);

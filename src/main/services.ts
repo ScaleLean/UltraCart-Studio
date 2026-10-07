@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { ConnectionService } from './domain/connection-service';
-import { DraftService, draftHash, containerPath } from './domain/draft-service';
+import { DraftService, draftHash, containerPath, parseJson } from './domain/draft-service';
 import { draftSaveSchema, draftScopeSchema } from '../shared/drafts';
 import { readContentMap } from './content-map';
 import { WidgetIdsService } from './widget-ids';
@@ -71,6 +71,8 @@ export class StudioServices {
   readonly sampleDrafts: DraftService;
   readonly widgetIds: WidgetIdsService;
   private publishBusy = new Set<string>();
+  private reported = new Set<string>();
+  private nativeIdsBusy = new Map<string, symbol>();
   constructor(
     readonly store: Store,
     readonly emit: () => void,
@@ -105,24 +107,36 @@ export class StudioServices {
       previousWorkspace.id !== workspaceId(previousWorkspace.selection)
     ) {
       const id = workspaceId(previousWorkspace.selection);
-      store.set(`pages:${id}`, store.get(`pages:${previousWorkspace.id}`, []));
-      store.set('workspace', { ...previousWorkspace, id });
-      const sessions = store.db
-        .prepare('SELECT value FROM sessions WHERE workspace_id = ?')
-        .all(previousWorkspace.id);
-      for (const row of sessions) {
-        const session = JSON.parse(row.value as string);
-        store.saveSession({ ...session, workspaceId: workspaceId(session.scope.selection) });
+      store.db.exec('BEGIN IMMEDIATE');
+      try {
+        store.set(`pages:${id}`, store.get(`pages:${previousWorkspace.id}`, []));
+        store.set('workspace', { ...previousWorkspace, id });
+        const sessions = store.db
+          .prepare('SELECT id, value FROM sessions WHERE workspace_id = ?')
+          .all(previousWorkspace.id);
+        for (const row of sessions) {
+          try {
+            const session = JSON.parse(row.value as string);
+            store.saveSession({ ...session, workspaceId: workspaceId(session.scope.selection) });
+          } catch {
+            console.error(`Skipped an unreadable conversation during workspace migration: ${row.id}`);
+          }
+        }
+        store.db
+          .prepare(
+            "UPDATE activity SET workspace_id = ?, value = json_set(value, '$.workspaceId', ?) WHERE workspace_id = ? AND json_valid(value)"
+          )
+          .run(id, id, previousWorkspace.id);
+        store.db.exec('COMMIT');
+      } catch (error) {
+        store.db.exec('ROLLBACK');
+        throw error;
       }
-      store.db
-        .prepare(
-          "UPDATE activity SET workspace_id = ?, value = json_set(value, '$.workspaceId', ?) WHERE workspace_id = ?"
-        )
-        .run(id, id, previousWorkspace.id);
     }
     this.connection = new ConnectionService(async () => this.settings());
-    this.drafts = new DraftService(store.db, this.connection);
-    this.sampleDrafts = new DraftService(store.db, sampleToolkit);
+    const snapshot = (record: Record, draft: Draft) => this.snapshot(record, draft);
+    this.drafts = new DraftService(store.db, this.connection, snapshot);
+    this.sampleDrafts = new DraftService(store.db, sampleToolkit, snapshot);
     this.widgetIds = new WidgetIdsService(this);
   }
   private draftService(scope: DraftScope) {
@@ -134,8 +148,6 @@ export class StudioServices {
   saveSettings(input: unknown) {
     const parsed = z
       .object({
-        nodePath: z.string().max(4096).refine(isAbsolute),
-        cliPath: z.string().max(4096).refine(isAbsolute),
         provider: z.enum(['openai', 'openai-codex']),
         model: z.string().min(1).max(150),
         reasoning: z.enum(['low', 'medium', 'high']),
@@ -143,9 +155,20 @@ export class StudioServices {
       })
       .strict()
       .parse(input);
-    this.store.set('settings', parsed);
+    // Paths are only changed through savePath, so a save never overwrites a path picked meanwhile.
+    const { nodePath, cliPath } = this.settings();
+    const next = { ...parsed, nodePath, cliPath };
+    this.store.set('settings', next);
     this.emit();
-    return parsed;
+    return next;
+  }
+  /** Persists one executable path chosen through a native dialog in the main process. */
+  savePath(kind: 'nodePath' | 'cliPath', path: string) {
+    const parsed = z.string().max(4096).refine(isAbsolute).parse(path);
+    const next = { ...this.settings(), [kind]: parsed };
+    this.store.set('settings', next);
+    this.emit();
+    return next;
   }
   workspace() {
     return this.store.get<Workspace>('workspace', sampleWorkspace);
@@ -206,18 +229,36 @@ export class StudioServices {
     if (!this.pages().some((p) => p.path === path)) throw new Error('Select a page in this storefront.');
     return draftScopeSchema.parse({ selection: workspace.selection, path, slot });
   }
-  private record(id: string): Record {
-    for (const row of this.store.db.prepare('SELECT record FROM storefront_drafts').all()) {
-      const record = JSON.parse(row.record as string) as Record;
-      if (record.id === id) return record;
-    }
-    throw new Error('Draft not found.');
+  private records(): Record[] {
+    return this.store.db
+      .prepare('SELECT scope_key, record FROM storefront_drafts')
+      .all()
+      .flatMap((row) => {
+        try {
+          return [JSON.parse(row.record as string) as Record];
+        } catch {
+          this.unreadable(row.scope_key as string);
+          return [];
+        }
+      });
   }
-  private remember(draft: Draft) {
-    const record = this.record(draft.id);
+  private unreadable(key: string) {
+    if (this.reported.has(key)) return;
+    this.reported.add(key);
+    console.error(`Skipped an unreadable draft: ${key}`);
+  }
+  private record(id: string): Record {
+    const record = this.records().find((r) => r.id === id);
+    if (!record) throw new Error('Draft not found.');
+    return record;
+  }
+  private snapshot(record: Record, draft: Draft) {
     this.store.db
       .prepare('INSERT OR IGNORE INTO revisions (draft_id, revision, value) VALUES (?, ?, ?)')
       .run(draft.id, draft.revision, JSON.stringify({ at: new Date().toISOString(), record, draft }));
+  }
+  private remember(draft: Draft) {
+    this.snapshot(this.record(draft.id), draft);
     return draft;
   }
   getChange(id: string): Change {
@@ -253,12 +294,16 @@ export class StudioServices {
     };
   }
   changes(workspace = this.workspace()) {
-    return this.store.db
-      .prepare('SELECT record FROM storefront_drafts')
-      .all()
-      .map((row) => JSON.parse(row.record as string) as Record)
+    return this.records()
       .filter((r) => workspaceId(r.scope.selection) === workspace.id)
-      .map((r) => this.getChange(r.id))
+      .flatMap((r) => {
+        try {
+          return [this.getChange(r.id)];
+        } catch {
+          this.unreadable(r.id);
+          return [];
+        }
+      })
       .sort((a, b) => b.draft.updatedAt.localeCompare(a.draft.updatedAt));
   }
   async pull(scope: DraftScope) {
@@ -270,7 +315,7 @@ export class StudioServices {
   async save(input: unknown) {
     const v = draftSaveSchema.parse(input);
     this.assertEditable(v.id);
-    const draft = this.remember(await this.draftService(v).update(v, () => this.assertEditable(v.id)));
+    const draft = await this.draftService(v).update(v, () => this.assertEditable(v.id));
     this.store.log(
       workspaceId(v.selection),
       'draft',
@@ -280,7 +325,11 @@ export class StudioServices {
     this.emit();
     return draft;
   }
-  private assertEditable(id: string) {
+  private assertEditable(id: string, nativeIdsOwner?: symbol) {
+    if (this.nativeIdsBusy.has(id) && this.nativeIdsBusy.get(id) !== nativeIdsOwner)
+      throw new Error(
+        'Native widget IDs are being reserved. Wait for the reservation to finish before editing.'
+      );
     if (this.publishBusy.has(id))
       throw new Error('Publishing is in progress. Wait for verification before editing.');
     if (this.getChange(id).publishedAt)
@@ -291,9 +340,7 @@ export class StudioServices {
   async saveStructure(input: unknown) {
     const v = builderApplySchema.parse(input);
     this.assertEditable(v.id);
-    const draft = this.remember(
-      await this.draftService(v).updateStructure(v, () => this.assertEditable(v.id))
-    );
+    const draft = await this.draftService(v).updateStructure(v, () => this.assertEditable(v.id));
     this.store.log(
       workspaceId(v.selection),
       'draft',
@@ -317,28 +364,37 @@ export class StudioServices {
   async reserveNativeIds(scope: DraftScope, id: string, revision: number, confirmedHost: string) {
     this.assertEditable(id);
     const record = this.checkRecord(scope, id, revision);
+    // Edits to this draft are refused until the reserved IDs are written back, so a save cannot
+    // change the revision mid-allocation and strand the receipt.
+    const owner = Symbol(id);
     const assertCurrent = () => {
       if (!sameStore(this.workspace().selection, scope.selection))
         throw new Error(
           'The active storefront changed. Reserved IDs remain in the preparation receipt. Return to the original draft.'
         );
-      this.assertEditable(id);
+      this.assertEditable(id, owner);
       this.checkRecord(scope, id, revision);
     };
     assertCurrent();
-    const prepared = await new WidgetIdsService(this, { assertCurrent }).reserve({
-      selection: scope.selection,
-      content: record.content,
-      operationKey: `draft:${id}:revision:${revision}`,
-      confirmedHost,
-    });
-    assertCurrent();
-    const draft = this.remember(
-      await this.draftService(scope).updateContent(
-        { ...scope, id, revision, content: prepared.content },
-        assertCurrent
-      )
-    );
+    this.nativeIdsBusy.set(id, owner);
+    let draft: Draft, prepared: Awaited<ReturnType<WidgetIdsService['reserve']>>;
+    try {
+      prepared = await new WidgetIdsService(this, { assertCurrent }).reserve({
+        selection: scope.selection,
+        content: record.content,
+        operationKey: `draft:${id}:revision:${revision}`,
+        confirmedHost,
+      });
+      assertCurrent();
+      draft = this.remember(
+        await this.draftService(scope).updateContent(
+          { ...scope, id, revision, content: prepared.content },
+          assertCurrent
+        )
+      );
+    } finally {
+      this.nativeIdsBusy.delete(id);
+    }
     this.store.log(
       workspaceId(scope.selection),
       'draft',
@@ -365,25 +421,31 @@ export class StudioServices {
       .prepare('SELECT revision, value FROM revisions WHERE draft_id = ? ORDER BY revision DESC')
       .all(id)
       .map((row) => {
-        const v = JSON.parse(row.value as string);
-        return { revision: row.revision, at: v.at, changedFields: v.draft.changedFields };
+        const v = parseJson(row.value as string, `Revision ${row.revision} is unreadable.`);
+        return { revision: row.revision, at: v.at, changedFields: v.draft?.changedFields };
       });
   }
-  async restore(scope: DraftScope, id: string, revision: number) {
+  async restore(scope: DraftScope, id: string, revision: number, expectedRevision: number) {
     const current = this.draftService(scope).read(scope);
     if (current?.id !== id) throw new Error('Draft scope mismatch.');
+    if (current.revision !== expectedRevision)
+      throw new Error('This draft changed in another window. Reload it before restoring.');
     const row = this.store.db
       .prepare('SELECT value FROM revisions WHERE draft_id = ? AND revision = ?')
       .get(id, revision);
     if (!row) throw new Error('Revision not found.');
-    const snapshot = JSON.parse(row.value as string) as { draft: Draft; record?: Record };
+    const snapshot = parseJson(
+      row.value as string,
+      'This revision is unreadable and cannot be restored.'
+    ) as {
+      draft: Draft;
+      record?: Record;
+    };
     if (typeof snapshot.record?.content === 'string') {
       this.assertEditable(id);
-      const draft = this.remember(
-        await this.draftService(scope).updateContent(
-          { ...scope, id, revision: current.revision, content: snapshot.record.content },
-          () => this.assertEditable(id)
-        )
+      const draft = await this.draftService(scope).updateContent(
+        { ...scope, id, revision: expectedRevision, content: snapshot.record.content },
+        () => this.assertEditable(id)
       );
       this.store.log(
         workspaceId(scope.selection),
@@ -398,7 +460,7 @@ export class StudioServices {
     return this.save({
       ...scope,
       id,
-      revision: current.revision,
+      revision: expectedRevision,
       edits: prior.fields.map((f) => ({ pointer: f.pointer, value: f.value })),
     });
   }
@@ -440,7 +502,7 @@ export class StudioServices {
         truncated: z.boolean().optional(),
       })
       .parse(
-        JSON.parse(
+        parseJson(
           await this.connection.run([
             '--format',
             'json',
@@ -452,7 +514,8 @@ export class StudioServices {
             path,
             '--storefront',
             String(scope.selection.storefront.id),
-          ])
+          ]),
+          'The toolkit returned an unreadable template.'
         )
       );
     if (response.path !== undefined && response.path !== path)
@@ -501,7 +564,10 @@ export class StudioServices {
       throw new Error('Resolve validation errors or remote changes before previewing.');
     const prefix = ['--format', 'json', '--profile', scope.selection.profileId, 'sf', 'preview'];
     const storefront = ['--storefront', String(scope.selection.storefront.id)];
-    const started = JSON.parse(await this.connection.run([...prefix, 'start', ...storefront]));
+    const started = parseJson(
+      await this.connection.run([...prefix, 'start', ...storefront]),
+      'The toolkit returned an unreadable preview session.'
+    );
     const session = z
       .string()
       .regex(/^[a-fA-F0-9]{32}$/)
@@ -509,7 +575,7 @@ export class StudioServices {
     let staged: any;
     try {
       staged = await this.withFiles(record, async (file) =>
-        JSON.parse(
+        parseJson(
           await this.connection.run([
             ...prefix,
             'stage',
@@ -518,7 +584,8 @@ export class StudioServices {
             session,
             '--file',
             `${file}=${containerPath(scope.path, scope.slot)}`,
-          ])
+          ]),
+          'The toolkit returned an unreadable staging result.'
         )
       );
       const theme = z.number().int().positive().parse(staged.themeOid);
@@ -531,7 +598,7 @@ export class StudioServices {
         createdAt: new Date().toISOString(),
         applied: false,
       } satisfies Preview);
-      const opened = JSON.parse(
+      const opened = parseJson(
         await this.connection.run([
           ...prefix,
           'open',
@@ -542,7 +609,8 @@ export class StudioServices {
           String(theme),
           '--path',
           scope.path,
-        ])
+        ]),
+        'The toolkit returned an unreadable preview link.'
       );
       const url = new URL(z.string().parse(opened.access_url));
       if (
@@ -612,19 +680,95 @@ export class StudioServices {
           '--live',
         ])
       );
-      return await this.verifyPublish(scope, id, revision);
+      const change = await this.settlePublish(scope, id, revision);
+      if (!change.publishedAt)
+        throw new Error('UltraCart left the live page unchanged. Publish again to retry.');
+      return change;
     } finally {
       this.publishBusy.delete(id);
     }
   }
   async verifyPublish(scope: DraftScope, id: string, revision: number) {
+    if (this.publishBusy.has(id)) throw new Error('Wait for the current operation to finish.');
+    return this.settlePublish(scope, id, revision);
+  }
+  private async settlePublish(scope: DraftScope, id: string, revision: number) {
     const record = this.checkRecord(scope, id, revision);
     const attempt = this.store.get<{ revision: number; hash: string } | null>(`publish-attempt:${id}`, null);
     if (!attempt || attempt.revision !== revision) throw new Error('No matching publish attempt to verify.');
     if (attempt.hash !== draftHash(record.content))
       throw new Error('The saved content no longer matches this publish attempt.');
+    const outcome = this.publishOutcome(record, (await this.pullRemote(scope, record)).content);
+    if (outcome === 'draft') {
+      this.store.set(`published:${id}`, { revision, at: new Date().toISOString() });
+      this.store.log(workspaceId(scope.selection), 'store', 'Published content verified', scope.path);
+    } else if (outcome === 'baseline') {
+      this.store.delete(`publish-attempt:${id}`);
+      this.store.log(
+        workspaceId(scope.selection),
+        'store',
+        'Publish not applied',
+        `${scope.path} · live page unchanged, publish can be retried`
+      );
+    } else
+      throw new Error(
+        'The live page matches neither this revision nor its baseline. Abandon the attempt to continue from the live content.'
+      );
+    this.emit();
+    return this.getChange(id);
+  }
+  async abandonPublish(scope: DraftScope, id: string, revision: number, confirmation = '') {
+    if (this.publishBusy.has(id)) throw new Error('Wait for the current operation to finish.');
+    const record = this.checkRecord(scope, id, revision);
+    const attempt = this.store.get<{ revision: number } | null>(`publish-attempt:${id}`, null);
+    if (!attempt || attempt.revision !== revision) throw new Error('No matching publish attempt to abandon.');
+    this.publishBusy.add(id);
+    try {
+      const remote = await this.pullRemote(scope, record);
+      const outcome = this.publishOutcome(record, remote.content);
+      if (outcome === 'draft')
+        throw new Error('The live page matches this revision. Verify the publish instead.');
+      if (outcome === 'baseline') {
+        this.store.delete(`publish-attempt:${id}`);
+        this.store.log(
+          workspaceId(scope.selection),
+          'store',
+          'Publish attempt abandoned',
+          `${scope.path} · live page unchanged`
+        );
+      } else {
+        if (confirmation !== scope.selection.storefront.host)
+          throw new Error(
+            'The live page matches neither this revision nor its baseline. Type the exact storefront host to replace the draft with the live content.'
+          );
+        this.checkRecord(scope, id, revision);
+        const draft = this.rebase(scope, id, record, remote);
+        this.store.log(
+          workspaceId(scope.selection),
+          'store',
+          'Publish attempt abandoned',
+          `${scope.path} · revision ${draft.revision} opened from the live page`
+        );
+      }
+      this.emit();
+      return this.getChange(id);
+    } finally {
+      this.publishBusy.delete(id);
+    }
+  }
+  private publishOutcome(record: Record, content: string) {
+    const actual = parseJson(
+      content,
+      'The live content could not be read. The publish outcome remains unresolved. Retry verification.'
+    );
+    // Compare document structure because the server may normalize whitespace.
+    if (isDeepStrictEqual(actual, JSON.parse(record.content))) return 'draft';
+    if (isDeepStrictEqual(actual, JSON.parse(record.baseline))) return 'baseline';
+    return 'neither';
+  }
+  private async pullRemote(scope: DraftScope, record: Record) {
     await this.connection.verify(scope.selection);
-    const actual = await this.withFiles(record, async (snapshot) => {
+    return this.withFiles(record, async (snapshot) => {
       const file = snapshot + '.remote.cjson';
       await this.connection.run([
         '--format',
@@ -639,17 +783,46 @@ export class StudioServices {
         '--out',
         file,
       ]);
-      return readFile(file, 'utf8');
+      if ((await stat(file)).size > 512 * 1024 || (await stat(file + '.sf.json')).size > 1024 * 1024 + 8192)
+        throw new Error('This container exceeds the draft size limit.');
+      const content = await readFile(file, 'utf8');
+      const baselineState = await readFile(file + '.sf.json', 'utf8');
+      const state = parseJson(baselineState, 'The remote baseline does not match this page and store.');
+      const hash = draftHash(content);
+      if (
+        state?.version !== 1 ||
+        state.merchant !== scope.selection.merchantId ||
+        state.storefront !== scope.selection.storefront.id ||
+        state.to !== containerPath(scope.path, scope.slot) ||
+        state.hash !== hash ||
+        state.content !== content
+      )
+        throw new Error('The remote baseline does not match this page and store.');
+      return { content, baseline: content, baselineState, baselineHash: hash };
     });
-    // Compare document structure because the server may normalize whitespace.
-    if (!isDeepStrictEqual(JSON.parse(actual), JSON.parse(record.content)))
-      throw new Error(
-        'Remote content does not match the requested revision. The publish outcome remains unresolved.'
-      );
-    this.store.set(`published:${id}`, { revision, at: new Date().toISOString() });
-    this.store.log(workspaceId(scope.selection), 'store', 'Published content verified', scope.path);
-    this.emit();
-    return this.getChange(id);
+  }
+  private rebase(
+    scope: DraftScope,
+    id: string,
+    record: Record,
+    remote: Pick<Record, 'content' | 'baseline' | 'baselineState' | 'baselineHash'>
+  ) {
+    const next = { ...record, ...remote, revision: record.revision + 1, updatedAt: new Date().toISOString() };
+    this.store.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.store.db
+        .prepare(
+          "UPDATE storefront_drafts SET record = ? WHERE json_valid(record) AND json_extract(record, '$.id') = ?"
+        )
+        .run(JSON.stringify(next), id);
+      const draft = this.remember(this.drafts.read(scope)!);
+      this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(`publish-attempt:${id}`);
+      this.store.db.exec('COMMIT');
+      return draft;
+    } catch (error) {
+      this.store.db.exec('ROLLBACK');
+      throw error;
+    }
   }
   async nextDraft(scope: DraftScope, id: string, revision: number) {
     const record = this.checkRecord(scope, id, revision);
@@ -658,61 +831,17 @@ export class StudioServices {
     if (this.publishBusy.has(id)) throw new Error('Wait for the current operation to finish.');
     this.publishBusy.add(id);
     try {
-      await this.connection.verify(scope.selection);
-      const remote = await this.withFiles(record, async (snapshot) => {
-        const file = snapshot + '.remote.cjson';
-        await this.connection.run([
-          '--format',
-          'json',
-          '--profile',
-          scope.selection.profileId,
-          'sf',
-          'pull',
-          containerPath(scope.path, scope.slot),
-          '--storefront',
-          String(scope.selection.storefront.id),
-          '--out',
-          file,
-        ]);
-        if ((await stat(file)).size > 512 * 1024 || (await stat(file + '.sf.json')).size > 1024 * 1024 + 8192)
-          throw new Error('This container exceeds the draft size limit.');
-        const content = await readFile(file, 'utf8');
-        const baselineState = await readFile(file + '.sf.json', 'utf8');
-        const state = JSON.parse(baselineState);
-        const hash = draftHash(content);
-        if (
-          state.version !== 1 ||
-          state.merchant !== scope.selection.merchantId ||
-          state.storefront !== scope.selection.storefront.id ||
-          state.to !== containerPath(scope.path, scope.slot) ||
-          state.hash !== hash ||
-          state.content !== content
-        )
-          throw new Error('The remote baseline does not match this page and store.');
-        return { content, baseline: content, baselineState, baselineHash: hash };
-      });
+      const remote = await this.pullRemote(scope, record);
       this.checkRecord(scope, id, revision);
-      const next = { ...record, ...remote, revision: revision + 1, updatedAt: new Date().toISOString() };
-      this.store.db.exec('BEGIN IMMEDIATE');
-      try {
-        this.store.db
-          .prepare("UPDATE storefront_drafts SET record = ? WHERE json_extract(record, '$.id') = ?")
-          .run(JSON.stringify(next), id);
-        const draft = this.remember(this.drafts.read(scope)!);
-        this.store.db.prepare('DELETE FROM kv WHERE key = ?').run(`publish-attempt:${id}`);
-        this.store.db.exec('COMMIT');
-        this.store.log(
-          workspaceId(scope.selection),
-          'draft',
-          'New baseline opened',
-          `${scope.path} · revision ${draft.revision}`
-        );
-        this.emit();
-        return draft;
-      } catch (error) {
-        this.store.db.exec('ROLLBACK');
-        throw error;
-      }
+      const draft = this.rebase(scope, id, record, remote);
+      this.store.log(
+        workspaceId(scope.selection),
+        'draft',
+        'New baseline opened',
+        `${scope.path} · revision ${draft.revision}`
+      );
+      this.emit();
+      return draft;
     } finally {
       this.publishBusy.delete(id);
     }

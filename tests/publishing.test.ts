@@ -25,6 +25,7 @@ async function fixture() {
   let remote = sampleBody('/');
   let pushes = 0;
   let failAfterWrite = false;
+  let rejectPush = false;
   service.connection.verify = async () => selection.storefront;
   service.connection.validateLocal = async () =>
     JSON.stringify({ valid: true, errors: 0, warnings: 0, diagnostics: [] });
@@ -48,6 +49,7 @@ async function fixture() {
     }
     if (args.includes('push')) {
       pushes++;
+      if (rejectPush) throw new Error('403 Forbidden');
       remote = await readFile(args[args.indexOf('push') + 1], 'utf8');
       if (failAfterWrite) throw new Error('Connection lost after write');
       return '{}';
@@ -65,6 +67,13 @@ async function fixture() {
     disconnectAfterWrite: () => {
       failAfterWrite = true;
     },
+    rejectPushes: (value = true) => {
+      rejectPush = value;
+    },
+    setRemote: (text: string) => {
+      remote = text;
+    },
+    remote: () => remote,
     changeRemote: () => {
       remote = sampleBody('/shop/');
     },
@@ -151,6 +160,162 @@ test('an uncertain write is verified without replay, and a new draft preserves r
       edits: [{ pointer: draft.fields[1].pointer, value: 'The next change.' }],
     });
     assert.equal(f.service.getChange(draft.id).draft.revision, 4);
+  } finally {
+    await f.cleanup();
+  }
+});
+async function previewed(f: Awaited<ReturnType<typeof fixture>>) {
+  const { scope, draft } = await edited(f);
+  await f.service.stage(scope, draft.id, draft.revision);
+  f.service.markPreview(draft.id, draft.revision);
+  return { scope, draft };
+}
+test('a rejected push with an unchanged live page clears the attempt and allows a retry', async () => {
+  const f = await fixture();
+  try {
+    const { scope, draft } = await previewed(f);
+    f.rejectPushes();
+    await assert.rejects(f.service.publish(scope, draft.id, draft.revision, 'test.example'), /403/);
+    assert.equal(f.service.getChange(draft.id).status, 'unverified');
+    const settled = await f.service.verifyPublish(scope, draft.id, draft.revision);
+    assert.equal(settled.publishPending, false);
+    assert.equal(settled.publishedAt, null);
+    assert(f.store.activity(workspaceId(scope.selection)).some((a) => a.text === 'Publish not applied'));
+    f.rejectPushes(false);
+    const published = await f.service.publish(scope, draft.id, draft.revision, 'test.example');
+    assert.equal(published.status, 'published');
+    assert.equal(f.pushes(), 2);
+  } finally {
+    await f.cleanup();
+  }
+});
+test('a push the server ignores reports a retryable result instead of success', async () => {
+  const f = await fixture();
+  try {
+    const { scope, draft } = await previewed(f);
+    const before = f.remote();
+    const run = f.service.connection.run;
+    f.service.connection.run = async (args, options) => {
+      if (!args.includes('push')) return run(args, options);
+      f.setRemote(before);
+      return '{}';
+    };
+    await assert.rejects(
+      f.service.publish(scope, draft.id, draft.revision, 'test.example'),
+      /left the live page unchanged/
+    );
+    assert.equal(f.service.getChange(draft.id).publishPending, false);
+  } finally {
+    await f.cleanup();
+  }
+});
+test('a live page matching neither revision nor baseline requires a confirmed abandon', async () => {
+  const f = await fixture();
+  try {
+    const { scope, draft } = await previewed(f);
+    f.rejectPushes();
+    await assert.rejects(f.service.publish(scope, draft.id, draft.revision, 'test.example'));
+    f.changeRemote();
+    await assert.rejects(f.service.verifyPublish(scope, draft.id, draft.revision), /matches neither/);
+    assert.equal(f.service.getChange(draft.id).publishPending, true);
+    await assert.rejects(f.service.abandonPublish(scope, draft.id, draft.revision), /exact storefront host/);
+    await assert.rejects(
+      f.service.abandonPublish(scope, draft.id, draft.revision, 'wrong.example'),
+      /exact storefront host/
+    );
+    assert.equal(f.service.getChange(draft.id).publishPending, true);
+    const change = await f.service.abandonPublish(scope, draft.id, draft.revision, 'test.example');
+    assert.equal(change.publishPending, false);
+    assert.equal(change.draft.revision, draft.revision + 1);
+    assert.equal(change.draft.changedFields, 0);
+    assert.equal(f.service.exportDraft(scope, draft.id, change.draft.revision), f.remote());
+    assert.deepEqual(
+      f.service.history(draft.id).map((r) => r.revision),
+      [3, 2, 1]
+    );
+    await f.service.save({
+      ...scope,
+      id: draft.id,
+      revision: 3,
+      edits: [{ pointer: change.draft.fields[1].pointer, value: 'After abandon.' }],
+    });
+  } finally {
+    await f.cleanup();
+  }
+});
+test('abandoning with an unchanged live page keeps the draft edits without confirmation', async () => {
+  const f = await fixture();
+  try {
+    const { scope, draft } = await previewed(f);
+    f.rejectPushes();
+    await assert.rejects(f.service.publish(scope, draft.id, draft.revision, 'test.example'));
+    const change = await f.service.abandonPublish(scope, draft.id, draft.revision);
+    assert.equal(change.publishPending, false);
+    assert.equal(change.draft.revision, draft.revision);
+    assert.equal(change.draft.fields[1].value, 'A reviewed change.');
+    await assert.rejects(
+      f.service.abandonPublish(scope, draft.id, draft.revision),
+      /No matching publish attempt/
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+test('a non-JSON pull during verification is a recoverable error', async () => {
+  const f = await fixture();
+  try {
+    const { scope, draft } = await previewed(f);
+    f.disconnectAfterWrite();
+    await assert.rejects(f.service.publish(scope, draft.id, draft.revision, 'test.example'));
+    const written = f.remote();
+    f.setRemote('{"truncated":');
+    await assert.rejects(
+      f.service.verifyPublish(scope, draft.id, draft.revision),
+      (error: Error) => !(error instanceof SyntaxError) && /Retry verification/.test(error.message)
+    );
+    assert.equal(f.service.getChange(draft.id).publishPending, true);
+    f.setRemote(written);
+    assert.equal((await f.service.verifyPublish(scope, draft.id, draft.revision)).status, 'published');
+  } finally {
+    await f.cleanup();
+  }
+});
+test('a corrupt conversation row does not stop the startup workspace migration', async () => {
+  const f = await fixture();
+  try {
+    const selection: Selection = f.store.get<Workspace>('workspace', {} as Workspace).selection;
+    const current = workspaceId(selection);
+    const old: Workspace = { id: 'legacy-id', kind: 'live', label: 'Test store', selection };
+    f.store.set('workspace', old);
+    f.store.set('pages:legacy-id', samplePages);
+    const good = {
+      id: 'good',
+      workspaceId: 'legacy-id',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      scope: { selection: selection, path: '/', slot: 'body' },
+    };
+    f.store.db
+      .prepare('INSERT INTO sessions (id, workspace_id, updated_at, value) VALUES (?, ?, ?, ?)')
+      .run('good', 'legacy-id', good.updatedAt, JSON.stringify(good));
+    for (const [id, value] of [
+      ['bad-json', '{nope'],
+      ['bad-shape', '{"id":"x"}'],
+    ])
+      f.store.db
+        .prepare('INSERT INTO sessions (id, workspace_id, updated_at, value) VALUES (?, ?, ?, ?)')
+        .run(id, 'legacy-id', good.updatedAt, value);
+    const originalError = console.error;
+    const logged: string[] = [];
+    console.error = (message: string) => void logged.push(message);
+    let migrated: StudioServices;
+    try {
+      migrated = new StudioServices(f.store, () => {}, f.store.directory);
+    } finally {
+      console.error = originalError;
+    }
+    assert.equal(migrated.workspace().id, current);
+    assert.equal(f.store.session('good').workspaceId, current);
+    assert.equal(logged.length, 2);
   } finally {
     await f.cleanup();
   }

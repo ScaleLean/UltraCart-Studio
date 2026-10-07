@@ -52,7 +52,14 @@ import { AgentPanel, WorkspaceCanvas } from './components/workspace';
 import { LandingStudio } from './components/landing-studio';
 import { Warehouse } from './components/warehouse';
 import { ToolkitReference } from './components/toolkit-reference';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from './components/ui/dialog';
 import { SettingsDialog, ConnectDialog } from './components/settings';
 import { cn } from './lib/utils';
 import { catalogRows, pageAncestors } from './lib/catalog';
@@ -104,13 +111,27 @@ export function App() {
   const sequence = useRef(0);
   const workspaceIdentity = useRef('');
   const featureSequence = useRef(0);
+  const unsaved = useRef(new Set<Screen>());
+  const [discard, setDiscard] = useState<{ action: () => void } | null>(null);
+  // Bumped when the user confirms a discard, so editors remount even if the workspace did not change.
+  const [discardEpoch, setDiscardEpoch] = useState(0);
+  const reportUnsaved = useCallback((source: Screen, dirty: boolean) => {
+    if (dirty) unsaved.current.add(source);
+    else unsaved.current.delete(source);
+  }, []);
   const refresh = useCallback(async () => {
     const seq = ++sequence.current;
     try {
       const result = await invoke<Bootstrap>('bootstrap');
       if (seq !== sequence.current) return;
       const identity = JSON.stringify([result.workspace.id, result.workspace.selection.verifiedAt]);
-      if (workspaceIdentity.current && workspaceIdentity.current !== identity) {
+      const sameWorkspace = workspaceIdentity.current.startsWith(`["${result.workspace.id}",`);
+      // A re-verify keeps the screen when there are unsaved edits; a different workspace remounts it anyway.
+      if (
+        workspaceIdentity.current &&
+        workspaceIdentity.current !== identity &&
+        !(sameWorkspace && unsaved.current.size)
+      ) {
         setPage(result.pages.some((p) => p.path === '/') ? '/' : result.pages[0]?.path || '/');
         setActiveSession(null);
         setSlot('body');
@@ -175,26 +196,49 @@ export function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = data?.settings.theme || 'light';
   }, [data?.settings.theme]);
-  const goTo = (next: Screen) => {
-    setFeatureAgent(null);
-    setScreen(next);
+  useEffect(() => {
+    // The main process asks this before quitting so it can confirm natively before stopping the engine.
+    (window as unknown as { __studioHasUnsaved?: () => boolean }).__studioHasUnsaved = () =>
+      unsaved.current.size > 0;
+    return () => {
+      delete (window as unknown as { __studioHasUnsaved?: () => boolean }).__studioHasUnsaved;
+    };
+  }, []);
+  useEffect(() => {
+    const handler = (event: BeforeUnloadEvent) => {
+      if (unsaved.current.size) event.preventDefault();
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, []);
+  // Ask before a navigation would unmount a screen that holds unsaved edits.
+  const leave = (next: Screen, action: () => void) => {
+    if (unsaved.current.has(screen) && next !== screen) setDiscard({ action });
+    else action();
   };
-  const openPage = (path: string, nextSlot = 'body') => {
-    const known = new Set(data?.pages.map((p) => p.path) || []);
-    setExpanded((previous) => new Set([...previous, ...pageAncestors(path, known)]));
-    setPage(path);
-    setSlot(nextSlot);
-    setScreen('canvas');
-    setActiveSession(null);
-    setInitialPrompt('');
-    setFeatureAgent(null);
-  };
-  const openFeature = (target: 'landing' | 'warehouse') => {
-    setFeatureAgent(null);
-    setScreen(target);
-    setInitialPrompt('');
-    setActiveSession(null);
-  };
+  const goTo = (next: Screen) =>
+    leave(next, () => {
+      setFeatureAgent(null);
+      setScreen(next);
+    });
+  const openPage = (path: string, nextSlot = 'body') =>
+    leave('canvas', () => {
+      const known = new Set(data?.pages.map((p) => p.path) || []);
+      setExpanded((previous) => new Set([...previous, ...pageAncestors(path, known)]));
+      setPage(path);
+      setSlot(nextSlot);
+      setScreen('canvas');
+      setActiveSession(null);
+      setInitialPrompt('');
+      setFeatureAgent(null);
+    });
+  const openFeature = (target: 'landing' | 'warehouse') =>
+    leave(target, () => {
+      setFeatureAgent(null);
+      setScreen(target);
+      setInitialPrompt('');
+      setActiveSession(null);
+    });
   const openLandingAgent = (project: LandingProject, prompt: string) => {
     if (project.workspaceId !== data?.workspace.id) return;
     const session = data.sessions.find(
@@ -226,6 +270,16 @@ export function App() {
     });
   };
   const openSession = (session: Session) => {
+    if (session.workspaceId !== data?.workspace.id) return;
+    const next: Screen =
+      session.target?.kind === 'landing'
+        ? 'landing'
+        : session.target?.kind === 'warehouse'
+          ? 'warehouse'
+          : 'canvas';
+    leave(next, () => showSession(session));
+  };
+  const showSession = (session: Session) => {
     if (session.workspaceId !== data?.workspace.id) return;
     setInitialPrompt('');
     if (session.target?.kind === 'landing') {
@@ -265,14 +319,15 @@ export function App() {
     setActiveSession(session.id);
     setScreen('canvas');
   };
-  const ask = (prompt: string) => {
-    setSlot('body');
-    setFeatureAgent(null);
-    setPage(data?.pages.some((p) => p.path === '/') ? '/' : data?.pages[0]?.path || '/');
-    setInitialPrompt(prompt);
-    setScreen('canvas');
-    setActiveSession(null);
-  };
+  const ask = (prompt: string) =>
+    leave('canvas', () => {
+      setSlot('body');
+      setFeatureAgent(null);
+      setPage(data?.pages.some((p) => p.path === '/') ? '/' : data?.pages[0]?.path || '/');
+      setInitialPrompt(prompt);
+      setScreen('canvas');
+      setActiveSession(null);
+    });
   async function refreshCatalog() {
     setRefreshing(true);
     try {
@@ -516,7 +571,11 @@ export function App() {
         {engine === 'error' && (
           <div className="engine-banner">
             <WifiOff size={14} /> The engine needs a restart. Your saved work is on disk.
-            <Button size="sm" variant="outline" onClick={() => invoke('app.restartEngine')}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => invoke('app.restartEngine').catch((error) => toast.error(errorText(error)))}
+            >
               Restart engine
             </Button>
           </div>
@@ -554,10 +613,11 @@ export function App() {
         )}
         {screen === 'landing' && (
           <LandingStudio
-            key={data.workspace.id}
+            key={`${data.workspace.id}:${discardEpoch}`}
             boot={data}
             selectedId={selectedLandingId}
             onAgent={openLandingAgent}
+            onUnsavedChange={(dirty) => reportUnsaved('landing', dirty)}
           />
         )}
         {screen === 'warehouse' && (
@@ -658,6 +718,33 @@ export function App() {
           )}
         </DialogContent>
       </Dialog>
+      <Dialog open={!!discard} onOpenChange={(open) => !open && setDiscard(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Discard unsaved edits?</DialogTitle>
+            <DialogDescription>
+              You have unsaved edits in this screen. Leaving now will discard them.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDiscard(null)}>
+              Keep editing
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                const action = discard?.action;
+                setDiscard(null);
+                unsaved.current.clear();
+                setDiscardEpoch((n) => n + 1);
+                action?.();
+              }}
+            >
+              Discard and continue
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <SettingsDialog
         open={settings}
         onOpenChange={setSettings}
@@ -665,7 +752,22 @@ export function App() {
         refresh={refresh}
         initialTab={screen === 'toolkit' ? 'runtime' : undefined}
       />
-      <ConnectDialog open={connect} onOpenChange={setConnect} data={data} refresh={refresh} />
+      <ConnectDialog
+        open={connect}
+        onOpenChange={setConnect}
+        data={data}
+        refresh={refresh}
+        guard={(action) => {
+          if (unsaved.current.size)
+            setDiscard({
+              action: () => {
+                unsaved.current.clear();
+                action();
+              },
+            });
+          else action();
+        }}
+      />
       <CommandDialog
         open={palette}
         onOpenChange={setPalette}

@@ -43,6 +43,8 @@ type DialogProps = {
   data: Bootstrap;
   refresh: () => Promise<void>;
   initialTab?: 'agent' | 'runtime' | 'appearance';
+  /** Confirms with the user before an action that replaces the workspace (unsaved edits). */
+  guard?: (action: () => void) => void;
 };
 export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }: DialogProps) {
   const [settings, setSettings] = useState<Settings>(data.settings);
@@ -62,6 +64,23 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
       await invoke('settings.save', next);
       await refresh();
       toast.success('Preferences saved');
+    } catch (e) {
+      toast.error(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function pickPath(kind: 'nodePath' | 'cliPath') {
+    setBusy(true);
+    try {
+      const result = await invoke<{ changed: boolean; settings: Settings }>(
+        kind === 'nodePath' ? 'settings.pickNodePath' : 'settings.pickCliPath'
+      );
+      if (result.changed) {
+        setSettings((current) => ({ ...current, [kind]: result.settings[kind] }));
+        await refresh();
+        toast.success('Toolkit path saved');
+      }
     } catch (e) {
       toast.error(errorText(e));
     } finally {
@@ -175,7 +194,11 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
                   </div>
                   {data.auth.message && <p className="settings-note">{data.auth.message}</p>}
                   {data.auth.phase === 'waiting' && (
-                    <Button variant="ghost" size="sm" onClick={() => invoke('auth.cancel')}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => invoke('auth.cancel').catch((e) => toast.error(errorText(e)))}
+                    >
                       Cancel sign-in
                     </Button>
                   )}
@@ -271,19 +294,21 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
                 <FieldGroup>
                   <Field>
                     <FieldLabel htmlFor="node-path">Node 24 executable</FieldLabel>
-                    <Input
-                      id="node-path"
-                      value={settings.nodePath}
-                      onChange={(event) => setSettings({ ...settings, nodePath: event.target.value })}
-                    />
+                    <div className="flex gap-2">
+                      <Input id="node-path" value={settings.nodePath} readOnly />
+                      <Button variant="outline" disabled={busy} onClick={() => void pickPath('nodePath')}>
+                        Browse
+                      </Button>
+                    </div>
                   </Field>
                   <Field>
                     <FieldLabel htmlFor="cli-path">UltraCart toolkit entry</FieldLabel>
-                    <Input
-                      id="cli-path"
-                      value={settings.cliPath}
-                      onChange={(event) => setSettings({ ...settings, cliPath: event.target.value })}
-                    />
+                    <div className="flex gap-2">
+                      <Input id="cli-path" value={settings.cliPath} readOnly />
+                      <Button variant="outline" disabled={busy} onClick={() => void pickPath('cliPath')}>
+                        Browse
+                      </Button>
+                    </div>
                   </Field>
                 </FieldGroup>
                 <div className="runtime-note">
@@ -355,7 +380,7 @@ export function SettingsDialog({ open, onOpenChange, data, refresh, initialTab }
   );
 }
 
-export function ConnectDialog({ open, onOpenChange, data, refresh }: DialogProps) {
+export function ConnectDialog({ open, onOpenChange, data, refresh, guard }: DialogProps) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profile, setProfile] = useState('');
   const [stores, setStores] = useState<Storefront[]>([]);
@@ -426,7 +451,13 @@ export function ConnectDialog({ open, onOpenChange, data, refresh }: DialogProps
       setBusy('');
     }
   }
-  async function connect() {
+  function connect() {
+    if (!selected) return;
+    const run = () => void doConnect();
+    if (guard) guard(run);
+    else run();
+  }
+  async function doConnect() {
     if (!selected) return;
     setBusy('connect');
     setError('');
@@ -576,11 +607,17 @@ export function ConnectDialog({ open, onOpenChange, data, refresh }: DialogProps
         <DialogFooter>
           <Button
             variant="ghost"
-            onClick={async () => {
-              await invoke('workspace.sample');
-              await refresh();
-              onOpenChange(false);
-            }}
+            onClick={() =>
+              (guard || ((action: () => void) => action()))(async () => {
+                try {
+                  await invoke('workspace.sample');
+                  await refresh();
+                  onOpenChange(false);
+                } catch (error) {
+                  toast.error(errorText(error));
+                }
+              })
+            }
           >
             Use sample store
           </Button>

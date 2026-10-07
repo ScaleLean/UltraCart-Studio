@@ -340,6 +340,59 @@ test('landing native reservations require host confirmation and preserve the edi
   }
 });
 
+test('a draft edit during landing ID allocation keeps the allocated IDs with the preparation', async () => {
+  const f = await preparationFixture();
+  try {
+    let allocations = 0;
+    let landing!: LandingService;
+    const ids = new WidgetIdsService(f.services, {
+      schemaFor: async () => ({ properties: {} }),
+      transport: {
+        verify: async () => f.selection.storefront,
+        reserve: async (_selection, count) => {
+          allocations++;
+          landing.update({ ...target(f.project), brief: { ...brief, title: 'Edited during allocation' } });
+          return { ids: Array.from({ length: count }, (_, index) => 1000 + index), count };
+        },
+      },
+    });
+    landing = new LandingService(f.services, ids);
+    await landing.prepare({ ...target(f.project), groupTemplate: 'landing.vm', itemTemplate: 'item.vm' });
+    await assert.rejects(
+      landing.reserveNativeIds({ ...target(f.project), confirmedHost: f.selection.storefront.host }),
+      /changed|revision/i
+    );
+    assert.equal(allocations, 1);
+    const record = f.store.get<{
+      content: string;
+      receipt: { status: string; id: string } | null;
+      view: { nativeIds: { status: string; receiptId: string | null } };
+    } | null>(`landing-preparation:${f.project.id}`, null)!;
+    assert.equal(record.receipt?.status, 'complete');
+    assert.equal(record.view.nativeIds.status, 'reserved');
+    assert.equal(record.view.nativeIds.receiptId, record.receipt?.id);
+    assert(!record.content.includes('studio-local-'));
+    assert.equal(landing.preparation({ id: f.project.id })?.stale, true);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('landing preparation reports an unreadable template response clearly', async () => {
+  const f = await preparationFixture();
+  try {
+    const run = f.services.connection.run;
+    f.services.connection.run = async (args, options) =>
+      args.includes('templates') ? 'not json' : run(args, options);
+    await assert.rejects(
+      f.landing.prepare({ ...target(f.project), groupTemplate: 'landing.vm', itemTemplate: 'item.vm' }),
+      /unreadable template list/
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test('landing brief creates a local native draft and exports a scoped package without remote access', async () => {
   const f = await fixture();
   try {

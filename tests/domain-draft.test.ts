@@ -27,7 +27,7 @@ const body = JSON.stringify({
   config: {},
   childWidgets: [{ type: 'text', id: 'copy', config: { text: 'Original', 'slash/key': 'Escaped' } }],
 });
-function setup() {
+function setup(onSave?: ConstructorParameters<typeof DraftService>[2]) {
   const db = new DatabaseSync(':memory:');
   db.exec('CREATE TABLE storefront_drafts (scope_key TEXT PRIMARY KEY, record TEXT NOT NULL)');
   const calls: string[][] = [];
@@ -65,7 +65,7 @@ function setup() {
       });
     },
   };
-  const drafts = new DraftService(db, toolkit);
+  const drafts = new DraftService(db, toolkit, onSave);
   return {
     db,
     drafts,
@@ -176,6 +176,60 @@ test('pull persists immutable baseline, resumes local draft, saves with CAS and 
     const temp = calls.find((args) => args[0] === 'validate')![1];
     await assert.rejects(readFile(temp));
     await assert.rejects(drafts.review({ ...scope, id: saved.id, revision: 1 }), /changed/);
+  } finally {
+    db.close();
+  }
+});
+test('a failed revision snapshot rolls back the draft save', async () => {
+  let fail = false;
+  const snapshots: number[] = [];
+  const { db, drafts } = setup((_, draft) => {
+    if (fail) throw new Error('disk full');
+    snapshots.push(draft.revision);
+  });
+  try {
+    const pulled = await drafts.pull(scope);
+    fail = true;
+    const edit = {
+      ...scope,
+      id: pulled.id,
+      revision: 1,
+      edits: [{ pointer: '/childWidgets/0/config/text', value: 'Updated' }],
+    };
+    await assert.rejects(drafts.update(edit), /disk full/);
+    assert.equal(drafts.read(scope)?.revision, 1);
+    assert.equal(drafts.read(scope)?.changedFields, 0);
+    fail = false;
+    assert.equal((await drafts.update(edit)).revision, 2);
+    assert.deepEqual(snapshots, [1, 2]);
+  } finally {
+    db.close();
+  }
+});
+test('unreadable toolkit output and failed structure inspection fail review closed', async () => {
+  assert.throws(() => parseDraftValidation('not json'), /invalid validation report/);
+  assert.throws(() => parseDraftValidation('null'), /invalid validation report/);
+  const { db, drafts } = setup();
+  try {
+    const pulled = await drafts.pull(scope);
+    const row = db.prepare('SELECT scope_key, record FROM storefront_drafts').get() as {
+      scope_key: string;
+      record: string;
+    };
+    const record = JSON.parse(row.record);
+    const tree = JSON.parse(record.content);
+    tree.childWidgets[0].config.text = 'Updated';
+    tree.childWidgets.push({ ...tree.childWidgets[0] });
+    record.content = JSON.stringify(tree);
+    db.prepare('UPDATE storefront_drafts SET record = ? WHERE scope_key = ?').run(
+      JSON.stringify(record),
+      row.scope_key
+    );
+    const reviewed = await drafts.review({ ...scope, id: pulled.id, revision: 1 });
+    assert.equal(reviewed.validation.valid, false);
+    assert(reviewed.validation.diagnostics.some((d) => d.code === 'STUDIO_INSPECTION_FAILED'));
+    db.prepare('UPDATE storefront_drafts SET record = ? WHERE scope_key = ?').run('{', row.scope_key);
+    assert.throws(() => drafts.read(scope), /saved draft is unreadable/);
   } finally {
     db.close();
   }

@@ -149,13 +149,17 @@ export function serializePageDocument(root: CjsonNode): string {
   return content;
 }
 
-function escapeHtml(value: string) {
+export function escapeHtml(value: string) {
   return value
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+/** Wrap plain text in a heading or paragraph tag, escaping HTML and keeping line breaks. */
+export function textHtml(text: string, tag: string = 'p') {
+  return `<${tag}>${escapeHtml(text).replace(/\n/g, '<br>')}</${tag}>`;
 }
 export function safeSectionHref(value = '/') {
   let decoded = value;
@@ -197,7 +201,7 @@ function createNode(
   };
 }
 function textNode(title: string, text: string, tag: 'p' | 'h1' | 'h2' | 'h3' = 'p') {
-  return createNode('text', title, { html: `<${tag}>${escapeHtml(text).replace(/\n/g, '<br>')}</${tag}>` });
+  return createNode('text', title, { html: textHtml(text, tag) });
 }
 function buttonNode(options: SectionOptions) {
   return createNode('button', 'Call to action', {

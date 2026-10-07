@@ -1,3 +1,4 @@
+import { RestartBudget } from './restart-budget';
 import {
   app,
   BrowserWindow,
@@ -13,9 +14,11 @@ import {
 } from 'electron';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync, cpSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { StudioEvent } from '../shared/types';
+import type { Settings, StudioEvent } from '../shared/types';
+import type { WarehouseStatus } from '../shared/warehouse';
 import { assertSecureCredentialStorage } from './secure-storage';
 
 app.setName('UltraCart Studio');
@@ -24,15 +27,20 @@ if (process.env.UC_STUDIO_DATA) {
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   app.setPath('userData', profile);
 }
-const development = !!process.env.UC_STUDIO_DEV;
-const root =
-  process.env.UC_STUDIO_ROOT || (app.isPackaged ? process.resourcesPath : resolve(__dirname, '..'));
+// Developer overrides are ignored in packaged builds so a local process cannot redirect the bridge window or the toolkit root.
+const development = !app.isPackaged && !!process.env.UC_STUDIO_DEV;
+const root = app.isPackaged ? process.resourcesPath : process.env.UC_STUDIO_ROOT || resolve(__dirname, '..');
 const directory = process.env.UC_STUDIO_DATA || app.getPath('userData');
 let win: BrowserWindow;
 let worker: UtilityProcess | null = null;
 let ready: Promise<unknown>;
 let quitting = false;
-let restarts = 0;
+const restarts = new RestartBudget(3, 5 * 60_000);
+// Toolkit child processes (reported by the worker) that must not outlive it.
+const toolkitPids = new Set<number>();
+const PREVIEW_PARTITION = 'studio-preview';
+let previewSessionConfigured = false;
+let previewCleared: Promise<unknown> = Promise.resolve();
 let preview: WebContentsView | null = null;
 let previewGeneration = 0;
 const pending = new Map<
@@ -77,6 +85,35 @@ function call(method: string, params?: unknown): Promise<any> {
     worker!.postMessage({ id, method, params });
   });
 }
+function killToolkitChildren() {
+  for (const pid of toolkitPids) {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+        .on('error', () => undefined)
+        .unref();
+      continue;
+    }
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* Already exited. */
+      }
+    }
+  }
+  toolkitPids.clear();
+}
+// Ask the worker to close its children and database, then kill it if it does not finish in time.
+async function stopWorker() {
+  const current = worker;
+  if (!current) return;
+  await Promise.race([call('shutdown'), new Promise((resolve) => setTimeout(resolve, 3000))]).catch(
+    () => undefined
+  );
+  current.kill();
+}
 function launchWorker() {
   worker = utilityProcess.fork(join(__dirname, 'worker.mjs'), [], {
     serviceName: 'UltraCart Studio Engine',
@@ -85,6 +122,11 @@ function launchWorker() {
   worker.on('message', async (data) => {
     if (data.event) {
       send(data.event);
+      return;
+    }
+    if (data.child) {
+      if (data.child.state === 'started') toolkitPids.add(data.child.pid);
+      else toolkitPids.delete(data.child.pid);
       return;
     }
     if (data.host) {
@@ -119,12 +161,13 @@ function launchWorker() {
   });
   worker.on('exit', () => {
     worker = null;
+    killToolkitChildren();
     for (const p of pending.values()) {
       clearTimeout(p.timeout);
       p.reject(new Error('The engine restarted. Saved work will reopen.'));
     }
     pending.clear();
-    if (!quitting && restarts++ < 3) {
+    if (!quitting && restarts.take()) {
       send({ type: 'worker', status: 'restarting' });
       setTimeout(launchWorker, 750);
     } else if (!quitting)
@@ -195,6 +238,7 @@ const publicMethods = new Set([
   'draft.restore',
   'draft.publish',
   'draft.verify',
+  'draft.abandon',
   'draft.next',
   'session.create',
   'session.view',
@@ -211,11 +255,17 @@ function closePreview() {
     win.contentView.removeChildView(preview);
     preview.webContents.close();
     preview = null;
+    const ses = electronSession.fromPartition(PREVIEW_PARTITION);
+    previewCleared = Promise.all([ses.clearStorageData(), ses.clearCache(), ses.clearAuthCache()]).catch(
+      () => undefined
+    );
   }
 }
 async function openPreview(params: any) {
   closePreview();
   const generation = previewGeneration;
+  await previewCleared;
+  if (generation !== previewGeneration) return { opened: false };
   const source = await call('preview.prepare', params);
   if (generation !== previewGeneration) return { opened: false };
   const context = {
@@ -224,12 +274,14 @@ async function openPreview(params: any) {
     revision: source.revision,
     expectedPath: params.path,
   };
-  // Each preview gets its own ephemeral cookie jar. Preview credentials never reach the renderer.
-  const previewPartition = `studio-preview-${randomUUID()}`;
-  const ses = electronSession.fromPartition(previewPartition);
-  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-  ses.setPermissionCheckHandler(() => false);
-  ses.on('will-download', (event) => event.preventDefault());
+  // One in-memory partition is reused and cleared on close. Preview credentials never reach the renderer.
+  const ses = electronSession.fromPartition(PREVIEW_PARTITION);
+  if (!previewSessionConfigured) {
+    previewSessionConfigured = true;
+    ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+    ses.setPermissionCheckHandler(() => false);
+    ses.on('will-download', (event) => event.preventDefault());
+  }
   ses.webRequest.onHeadersReceived((details, callback) => {
     const header = Object.entries(details.responseHeaders || {})
       .find(([key]) => key.toLowerCase() === 'x-ultracart-preview')?.[1]
@@ -258,7 +310,7 @@ async function openPreview(params: any) {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
-      partition: previewPartition,
+      partition: PREVIEW_PARTITION,
     },
   });
   win.contentView.addChildView(preview);
@@ -296,6 +348,48 @@ async function openPreview(params: any) {
   return { opened: true };
 }
 
+// The renderer never supplies executable paths. Main asks the user through a native dialog,
+// and the worker persists only the path the dialog returned.
+async function pickPath(kind: 'nodePath' | 'cliPath') {
+  const current: Settings = await call('settings.current');
+  const node = kind === 'nodePath';
+  const result = await dialog.showOpenDialog(win, {
+    title: node ? 'Choose the Node 24 executable' : 'Choose the UltraCart toolkit entry (dist/bin.js)',
+    defaultPath: current[kind] || undefined,
+    properties: ['openFile', 'showHiddenFiles'],
+    filters: node
+      ? process.platform === 'win32'
+        ? [{ name: 'Executable', extensions: ['exe'] }]
+        : undefined
+      : [{ name: 'JavaScript', extensions: ['js', 'mjs', 'cjs'] }],
+  });
+  const path = result.filePaths[0];
+  if (result.canceled || !path) return { changed: false, settings: current };
+  return { changed: path !== current[kind], settings: await call('settings.setPath', { kind, path }) };
+}
+
+// The renderer never supplies the bq executable path. Main asks the user through a native dialog,
+// and the worker persists only the path the dialog returned.
+async function pickBqPath(params: unknown) {
+  const { workspaceId } = z
+    .object({ workspaceId: z.string().min(1).max(100) })
+    .strict()
+    .parse(params);
+  const current: WarehouseStatus = await call('warehouse.status', { workspaceId });
+  if (current.sample) throw new Error('The sample workspace does not run the BigQuery CLI.');
+  const result = await dialog.showOpenDialog(win, {
+    title: process.platform === 'win32' ? 'Choose the BigQuery CLI (bq.cmd)' : 'Choose the BigQuery CLI (bq)',
+    defaultPath: current.config.bqPath || undefined,
+    properties: ['openFile', 'showHiddenFiles'],
+    filters:
+      process.platform === 'win32' ? [{ name: 'BigQuery CLI', extensions: ['cmd', 'exe'] }] : undefined,
+  });
+  const path = result.filePaths[0];
+  if (result.canceled || !path) return { changed: false, status: current };
+  if (path === current.config.bqPath) return { changed: false, status: current };
+  return { changed: true, status: await call('warehouse.setBqPath', { workspaceId, bqPath: path }) };
+}
+
 ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) => {
   trusted(event);
   await ready;
@@ -310,6 +404,18 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
       auth: { ...result.auth, connected: false, phase: 'error', message: credentialLoadError },
     };
   }
+  if (method === 'settings.pickNodePath') return pickPath('nodePath');
+  if (method === 'settings.pickCliPath') return pickPath('cliPath');
+  if (method === 'settings.save') {
+    const requested = z.object({ nodePath: z.string(), cliPath: z.string() }).passthrough().parse(params);
+    const current: Settings = await call('settings.current');
+    if (requested.nodePath !== current.nodePath || requested.cliPath !== current.cliPath)
+      throw new Error('Choose the Node and toolkit paths with the Browse buttons.');
+    // Omit the path fields so the worker keeps the stored ones; a Browse pick that landed meanwhile survives.
+    const { nodePath: _node, cliPath: _cli, ...rest } = requested;
+    return call(method, rest);
+  }
+  if (method === 'warehouse.pickBqPath') return pickBqPath(params);
   if (publicMethods.has(method)) return call(method, params);
   if (method === 'preview.open') return openPreview(params);
   if (method === 'preview.close') {
@@ -374,8 +480,8 @@ ipcMain.handle('studio:invoke', async (event, method: string, params: unknown) =
     return { saved: !result.canceled };
   }
   if (method === 'app.restartEngine') {
-    restarts = 0;
-    worker?.kill();
+    restarts.reset();
+    await stopWorker();
     return true;
   }
   throw new Error('Unknown Studio operation.');
@@ -495,23 +601,78 @@ app.whenReady().then(async () => {
       win.hide();
     }
   });
+  // Once a quit is confirmed, the renderer's unsaved-edits guard must not block the window closing.
+  win.webContents.on('will-prevent-unload', (event) => {
+    if (quitting) event.preventDefault();
+  });
   app.on('activate', () => win.show());
   launchWorker();
   if (development) await win.loadURL('http://127.0.0.1:5178');
   else await win.loadFile(join(__dirname, 'renderer/index.html'));
   win.show();
 });
+let quitConfirmed = false;
+let quitAsking = false;
+// Ask the renderer about unsaved edits before anything is torn down; cancelling keeps a live engine.
+async function confirmQuit() {
+  if (quitAsking) return;
+  quitAsking = true;
+  try {
+    await askQuit();
+  } finally {
+    quitAsking = false;
+  }
+}
+async function askQuit() {
+  let unsaved: unknown = false;
+  try {
+    // A hung renderer must not block quitting, so an unanswered check counts as no unsaved edits.
+    unsaved = await Promise.race([
+      win.webContents.executeJavaScript('window.__studioHasUnsaved?.() === true'),
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 2000)),
+    ]);
+  } catch {}
+  // A hung renderer would also never answer the unload, so close its window without asking.
+  if (unsaved === 'timeout') {
+    quitConfirmed = true;
+    win.destroy();
+    app.quit();
+    return;
+  }
+  if (unsaved === true) {
+    win.show();
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'warning',
+      buttons: ['Quit and discard', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      message: 'You have unsaved edits.',
+      detail: 'Quitting now discards edits that have not been saved.',
+    });
+    if (response !== 0) return;
+  }
+  quitConfirmed = true;
+  app.quit();
+}
 app.on('before-quit', (event) => {
+  if (!quitting && !quitConfirmed && win && !win.isDestroyed()) {
+    event.preventDefault();
+    void confirmQuit();
+    return;
+  }
   if (!quitting) {
     quitting = true;
     closePreview();
+    // Last resort if the renderer hangs during the unload after a confirmed quit.
+    setTimeout(() => {
+      if (win && !win.isDestroyed()) win.destroy();
+    }, 5000).unref();
     if (!worker) return;
     event.preventDefault();
-    void Promise.race([call('shutdown'), new Promise((resolve) => setTimeout(resolve, 3000))])
-      .catch(() => undefined)
-      .finally(() => {
-        worker?.kill();
-        app.quit();
-      });
+    void stopWorker().finally(() => {
+      worker?.kill();
+      killToolkitChildren();
+      app.quit();
+    });
   }
 });
