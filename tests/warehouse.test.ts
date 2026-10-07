@@ -660,9 +660,10 @@ test('the real process runner never returns raw account or token text on CLI fai
 test('the real process runner decodes UTF-8 characters split across output chunks', async () => {
   const text = 'é'.repeat(70000) + '日本語🙂';
   // Write the bytes in two pieces, cutting through the middle of a two-byte character.
+  // The child builds the text itself; Linux caps a single argument at 128 KiB.
   const output = await runWarehouseCommand(process.execPath, [
     '-e',
-    `const b = Buffer.from(${JSON.stringify(text)}); process.stdout.write(b.subarray(0, 70001), () => setTimeout(() => process.stdout.write(b.subarray(70001)), 20));`,
+    `const b = Buffer.from('é'.repeat(70000) + '日本語🙂'); process.stdout.write(b.subarray(0, 70001), () => setTimeout(() => process.stdout.write(b.subarray(70001)), 20));`,
   ]);
   assert.equal(output, text);
   assert.doesNotMatch(output, /\uFFFD/);
